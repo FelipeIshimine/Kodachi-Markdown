@@ -1,0 +1,11 @@
+{
+  "name": "com.kodachigames.markdown",
+  "version": "0.1.0",
+  "displayName": "Kodachi Markdown",
+  "description": "Editor tool that discovers every Markdown (.md) file in the project — including files outside Assets/ and Packages/ such as root CLAUDE.md and docs/ — and presents them in a TreeView that collapses empty folder chains while keeping them visible in the path.",
+  "unity": "6000.0",
+  "author": {
+    "name": "Kodachi Games"
+  },
+  "dependencies": {}
+}

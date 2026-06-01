@@ -1,0 +1,16 @@
+{
+    "name": "KodachiGames.Markdown.Editor",
+    "rootNamespace": "KodachiGames.Markdown.Editor",
+    "references": [],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
