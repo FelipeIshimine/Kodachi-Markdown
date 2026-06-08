@@ -21,6 +21,10 @@ namespace KodachiGames.Markdown.Editor
         public static void Open() => GetWindow<MarkdownBrowserWindow>("Markdown");
 
         TreeView _tree;
+        TwoPaneSplitView _split;
+        VisualElement _leftPane;
+        Button _toggleTreeButton;
+        bool _treeVisible = true;
         ToolbarSearchField _search;
         Label _status;
         Label _previewPath;
@@ -32,6 +36,7 @@ namespace KodachiGames.Markdown.Editor
 
         FileEntrySelection _selected;
         string _rawText;
+        bool _truncated;
 
         static string ProjectRoot => Directory.GetParent(Application.dataPath)!.FullName.Replace('\\', '/');
 
@@ -58,6 +63,9 @@ namespace KodachiGames.Markdown.Editor
                 }
             };
 
+            _toggleTreeButton = new Button(ToggleTree) { text = "Hide Tree", style = { marginRight = 6 } };
+            toolbar.Add(_toggleTreeButton);
+
             toolbar.Add(new Button(Refresh) { text = "Refresh" });
 
             _search = new ToolbarSearchField { style = { flexGrow = 1, marginLeft = 6, marginRight = 6 } };
@@ -70,26 +78,37 @@ namespace KodachiGames.Markdown.Editor
             root.Add(toolbar);
 
             // ---- Split: tree | preview ----
-            var split = new TwoPaneSplitView(0, 320, TwoPaneSplitViewOrientation.Horizontal)
+            _split = new TwoPaneSplitView(0, 320, TwoPaneSplitViewOrientation.Horizontal)
             {
                 style = { flexGrow = 1 }
             };
-            root.Add(split);
+            root.Add(_split);
 
             // Wrap the TreeView in a container: TwoPaneSplitView writes style.width onto
             // its direct pane child, which collapses a bare TreeView to zero size.
-            var leftPane = new VisualElement { style = { flexGrow = 1, minWidth = 180 } };
+            _leftPane = new VisualElement { style = { flexGrow = 1, minWidth = 180 } };
             _tree = new TreeView { style = { flexGrow = 1 }, fixedItemHeight = 20 };
             _tree.makeItem = MakeRow;
             _tree.bindItem = BindRow;
             _tree.selectionChanged += _ => OnSelectionChanged();
             _tree.itemsChosen += _ => OpenSelectedExternally();
-            leftPane.Add(_tree);
-            split.Add(leftPane);
+            _leftPane.Add(_tree);
+            _split.Add(_leftPane);
 
-            split.Add(BuildPreviewPane());
+            _split.Add(BuildPreviewPane());
 
             Refresh();
+        }
+
+        void ToggleTree()
+        {
+            _treeVisible = !_treeVisible;
+            if (_treeVisible)
+                _split.UnCollapse();
+            else
+                _split.CollapseChild(0);
+
+            _toggleTreeButton.text = _treeVisible ? "Hide Tree" : "Show Tree";
         }
 
         VisualElement BuildPreviewPane()
@@ -206,15 +225,18 @@ namespace KodachiGames.Markdown.Editor
                     var buffer = new char[PreviewCharLimit];
                     var read = reader.Read(buffer, 0, buffer.Length);
                     _rawText = new string(buffer, 0, read) + "\n\n… (truncated)";
+                    _truncated = true;
                 }
                 else
                 {
                     _rawText = File.ReadAllText(file.FullPath);
+                    _truncated = false;
                 }
             }
             catch (System.Exception e)
             {
                 _rawText = $"(could not read file)\n{e.Message}";
+                _truncated = true;
             }
 
             RenderPreview();
@@ -226,7 +248,8 @@ namespace KodachiGames.Markdown.Editor
 
             if (_formatToggle.value)
             {
-                MarkdownView.Populate(_previewContent, _rawText);
+                MarkdownView.Populate(_previewContent, _rawText,
+                    _truncated ? null : ToggleCheckbox);
             }
             else
             {
@@ -238,6 +261,43 @@ namespace KodachiGames.Markdown.Editor
             }
 
             _previewScroll.scrollOffset = Vector2.zero;
+        }
+
+        static readonly System.Text.RegularExpressions.Regex CheckboxMarker =
+            new(@"\[[ xX]\]");
+
+        /// <summary>
+        /// Flips the checkbox marker on the given source line, persists the change to disk,
+        /// and re-renders. Line endings are normalised to <c>\n</c> on save.
+        /// </summary>
+        void ToggleCheckbox(int lineIndex, bool isChecked)
+        {
+            if (_selected == null || _rawText == null) return;
+
+            var lines = _rawText.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            if (lineIndex < 0 || lineIndex >= lines.Length) return;
+
+            lines[lineIndex] = CheckboxMarker.Replace(lines[lineIndex], isChecked ? "[x]" : "[ ]", 1);
+            _rawText = string.Join("\n", lines);
+
+            try
+            {
+                File.WriteAllText(_selected.FullPath, _rawText);
+
+                // Keep the asset database in sync when the file lives under Assets/.
+                var dataPath = Application.dataPath.Replace('\\', '/');
+                if (_selected.FullPath.StartsWith(dataPath + "/", System.StringComparison.OrdinalIgnoreCase))
+                {
+                    var assetPath = "Assets" + _selected.FullPath.Substring(dataPath.Length);
+                    AssetDatabase.ImportAsset(assetPath);
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"Failed to write checkbox change to {_selected.RelPath}: {e.Message}");
+            }
+
+            RenderPreview();
         }
 
         void ClearSelection()

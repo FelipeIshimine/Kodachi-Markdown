@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using UnityEngine;
@@ -17,6 +18,7 @@ namespace KodachiGames.Markdown.Editor
     public static class MarkdownView
     {
         static readonly Regex Heading = new(@"^(#{1,6})\s+(.*)$", RegexOptions.Compiled);
+        static readonly Regex Checkbox = new(@"^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$", RegexOptions.Compiled);
         static readonly Regex Bullet = new(@"^(\s*)[-*+]\s+(.*)$", RegexOptions.Compiled);
         static readonly Regex Numbered = new(@"^(\s*)(\d+)\.\s+(.*)$", RegexOptions.Compiled);
         static readonly Regex Quote = new(@"^>\s?(.*)$", RegexOptions.Compiled);
@@ -27,7 +29,12 @@ namespace KodachiGames.Markdown.Editor
         static readonly Color CodeColor = new(0.79f, 0.64f, 0.43f);
         static readonly Color MutedColor = new(1f, 1f, 1f, 0.55f);
 
-        public static void Populate(VisualElement container, string markdown)
+        /// <param name="onCheckboxToggled">
+        /// Invoked when a task-list checkbox (<c>- [ ]</c> / <c>- [x]</c>) is clicked, with the
+        /// zero-based source line index and the new checked state. Pass <c>null</c> to render
+        /// checkboxes as read-only (e.g. when the source text is truncated).
+        /// </param>
+        public static void Populate(VisualElement container, string markdown, Action<int, bool> onCheckboxToggled = null)
         {
             container.Clear();
             if (string.IsNullOrEmpty(markdown)) return;
@@ -44,8 +51,9 @@ namespace KodachiGames.Markdown.Editor
                 paragraph.Clear();
             }
 
-            foreach (var line in lines)
+            for (var lineIndex = 0; lineIndex < lines.Length; lineIndex++)
             {
+                var line = lines[lineIndex];
                 if (line.TrimStart().StartsWith("```"))
                 {
                     if (inFence) { container.Add(CodeBlock(fence)); fence.Clear(); inFence = false; }
@@ -78,6 +86,18 @@ namespace KodachiGames.Markdown.Editor
                 {
                     FlushParagraph();
                     container.Add(QuoteLabel(Clean(q.Groups[1].Value)));
+                    continue;
+                }
+
+                var c = Checkbox.Match(line);
+                if (c.Success)
+                {
+                    FlushParagraph();
+                    var indent = c.Groups[1].Value.Length;
+                    var isChecked = c.Groups[2].Value is "x" or "X";
+                    var sourceLine = lineIndex;
+                    container.Add(CheckboxItem(indent, isChecked, Clean(c.Groups[3].Value),
+                        onCheckboxToggled == null ? null : v => onCheckboxToggled(sourceLine, v)));
                     continue;
                 }
 
@@ -147,6 +167,36 @@ namespace KodachiGames.Markdown.Editor
             label.style.marginLeft = 12 + indent;
             label.style.marginBottom = 2;
             return label;
+        }
+
+        static VisualElement CheckboxItem(int indent, bool isChecked, string text, Action<bool> onToggled)
+        {
+            var row = new VisualElement
+            {
+                style =
+                {
+                    flexDirection = FlexDirection.Row,
+                    alignItems = Align.FlexStart,
+                    marginLeft = 12 + indent,
+                    marginBottom = 2
+                }
+            };
+
+            var toggle = new Toggle { value = isChecked, style = { marginRight = 4, marginTop = 1 } };
+            toggle.SetEnabled(onToggled != null);
+            if (onToggled != null)
+                toggle.RegisterValueChangedCallback(evt => onToggled(evt.newValue));
+            row.Add(toggle);
+
+            var label = PlainLabel(text);
+            label.style.flexGrow = 1;
+            if (isChecked)
+            {
+                label.style.color = MutedColor;
+                label.style.unityFontStyleAndWeight = FontStyle.Italic;
+            }
+            row.Add(label);
+            return row;
         }
 
         static VisualElement CodeBlock(List<string> codeLines)
