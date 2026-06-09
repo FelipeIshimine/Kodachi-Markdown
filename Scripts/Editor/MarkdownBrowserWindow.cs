@@ -38,6 +38,8 @@ namespace KodachiGames.Markdown.Editor
         string _rawText;
         bool _truncated;
 
+        const string TreeVisibleKey = "KodachiMarkdown.TreeVisible";
+
         static string ProjectRoot => Directory.GetParent(Application.dataPath)!.FullName.Replace('\\', '/');
 
         Texture2D _folderIcon;
@@ -98,6 +100,15 @@ namespace KodachiGames.Markdown.Editor
             _split.Add(BuildPreviewPane());
 
             Refresh();
+
+            // Restore tree visibility after layout (CollapseChild needs the split to be in the hierarchy).
+            _treeVisible = SessionState.GetBool(TreeVisibleKey, true);
+            if (!_treeVisible)
+                rootVisualElement.schedule.Execute(() =>
+                {
+                    _split.CollapseChild(0);
+                    _toggleTreeButton.text = "Show Tree";
+                });
         }
 
         void ToggleTree()
@@ -109,6 +120,7 @@ namespace KodachiGames.Markdown.Editor
                 _split.CollapseChild(0);
 
             _toggleTreeButton.text = _treeVisible ? "Hide Tree" : "Show Tree";
+            SessionState.SetBool(TreeVisibleKey, _treeVisible);
         }
 
         VisualElement BuildPreviewPane()
@@ -254,10 +266,27 @@ namespace KodachiGames.Markdown.Editor
             else
             {
                 _previewContent.Clear();
-                var raw = new Label(_rawText) { enableRichText = false };
-                raw.style.whiteSpace = WhiteSpace.Normal;
-                raw.selection.isSelectable = true;
-                _previewContent.Add(raw);
+                if (_selected != null && !_truncated)
+                {
+                    var field = new TextField { value = _rawText, multiline = true };
+                    field.style.flexGrow = 1;
+                    field.style.whiteSpace = WhiteSpace.Normal;
+                    // Write back to disk on every change so the file stays in sync.
+                    field.RegisterValueChangedCallback(evt =>
+                    {
+                        _rawText = evt.newValue;
+                        WriteRawText();
+                    });
+                    _previewContent.Add(field);
+                }
+                else
+                {
+                    // Truncated files are shown read-only to avoid partial writes.
+                    var raw = new Label(_rawText) { enableRichText = false };
+                    raw.style.whiteSpace = WhiteSpace.Normal;
+                    raw.selection.isSelectable = true;
+                    _previewContent.Add(raw);
+                }
             }
 
             _previewScroll.scrollOffset = Vector2.zero;
@@ -298,6 +327,21 @@ namespace KodachiGames.Markdown.Editor
             }
 
             RenderPreview();
+        }
+
+        void WriteRawText()
+        {
+            if (_selected == null || _rawText == null) return;
+            try
+            {
+                File.WriteAllText(_selected.FullPath, _rawText);
+                // Unity will pick up the change on editor focus; no need to call
+                // AssetDatabase.ImportAsset on every keystroke.
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"Failed to write {_selected.RelPath}: {e.Message}");
+            }
         }
 
         void ClearSelection()
