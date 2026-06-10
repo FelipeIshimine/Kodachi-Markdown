@@ -31,6 +31,7 @@ namespace KodachiGames.Markdown.Editor
         ScrollView _previewScroll;
         VisualElement _previewContent;
         Toggle _formatToggle;
+        Button _pinButton;
         Button _openButton;
         Button _revealButton;
 
@@ -138,6 +139,9 @@ namespace KodachiGames.Markdown.Editor
             _formatToggle.RegisterValueChangedCallback(_ => RenderPreview());
             header.Add(_formatToggle);
 
+            _pinButton = new Button(TogglePinSelected) { text = "Pin", style = { display = DisplayStyle.None, flexShrink = 0 } };
+            header.Add(_pinButton);
+
             _openButton = new Button(OpenSelectedExternally) { text = "Open", style = { display = DisplayStyle.None, flexShrink = 0} };
             _revealButton = new Button(RevealSelected) { text = "Reveal", style = { display = DisplayStyle.None , flexShrink = 0} };
             header.Add(_openButton);
@@ -227,6 +231,8 @@ namespace KodachiGames.Markdown.Editor
             _previewPath.text = file.RelPath;
             _openButton.style.display = DisplayStyle.Flex;
             _revealButton.style.display = DisplayStyle.Flex;
+            _pinButton.style.display = DisplayStyle.Flex;
+            RefreshPinButton();
 
             try
             {
@@ -352,6 +358,24 @@ namespace KodachiGames.Markdown.Editor
             _previewContent.Clear();
             _openButton.style.display = DisplayStyle.None;
             _revealButton.style.display = DisplayStyle.None;
+            _pinButton.style.display = DisplayStyle.None;
+        }
+
+        void TogglePinSelected()
+        {
+            if (_selected == null) return;
+            MarkdownPins.Toggle(_selected.FullPath);
+            RefreshPinButton();
+        }
+
+        void RefreshPinButton()
+        {
+            if (_selected == null) return;
+            var pinned = MarkdownPins.IsPinned(_selected.FullPath);
+            _pinButton.text = pinned ? "★ Pinned" : "Pin";
+            _pinButton.tooltip = pinned
+                ? "Unpin this file (remove from Ctrl+Shift+W quick view)"
+                : "Pin this file (show it in the Ctrl+Shift+W quick view)";
         }
 
         void OpenSelectedExternally()
