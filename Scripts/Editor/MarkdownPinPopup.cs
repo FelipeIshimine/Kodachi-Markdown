@@ -16,7 +16,9 @@ namespace KodachiGames.Markdown.Editor
     /// borderless panel folds open from the left edge, showing the pinned file rendered
     /// like the Markdown Browser's preview — no file tree. When several files are pinned,
     /// tabs along the top switch between them; the last viewed file is remembered.
-    /// Press the shortcut again, or Esc, to dismiss.
+    /// A header dropdown switches between formatted preview, raw editing, and a prioritised
+    /// Task view (<see cref="TaskView"/>); Ctrl/Cmd+E toggles Formatted/Edit. In Task view,
+    /// right-click a task to set its priority. Press the shortcut again, or Esc, to dismiss.
     /// </summary>
     public sealed class MarkdownPinPopup : EditorWindow
     {
@@ -93,7 +95,12 @@ namespace KodachiGames.Markdown.Editor
         ScrollView    _scroll;
         VisualElement _content;
         Label         _title;
-        Toggle        _formatToggle;
+        DropdownField _modeDropdown;
+
+        enum ViewMode { Formatted, Edit, Tasks }
+        static readonly string[] ModeLabels = { "Formatted", "Edit", "Tasks" };
+        const string ModeKey = "KodachiMarkdown.PinPopup.ViewMode"; // SessionState
+        ViewMode _mode = ViewMode.Formatted;
 
         readonly List<TabRef> _tabs = new();
         // Scroll offset per pinned file, so switching tabs returns to where you left off.
@@ -106,12 +113,24 @@ namespace KodachiGames.Markdown.Editor
 
         // ── Lifecycle ───────────────────────────────────────────────────────────
 
-        void OnEnable()  { _instance = this; MarkdownPins.Changed += OnPinsChanged; }
+        void OnEnable()
+        {
+            _instance = this;
+            MarkdownPins.Changed += OnPinsChanged;
+            ActiveTask.Changed += OnActiveTaskChanged;
+        }
         void OnDisable()
         {
             SaveRect();
             if (_instance == this) _instance = null;
             MarkdownPins.Changed -= OnPinsChanged;
+            ActiveTask.Changed -= OnActiveTaskChanged;
+        }
+
+        void OnActiveTaskChanged()
+        {
+            // Structural change (task set/cleared, paused) — refresh the Task view in place.
+            if (_mode == ViewMode.Tasks) { SaveScroll(); Render(); }
         }
 
         void OnPinsChanged()
@@ -148,11 +167,18 @@ namespace KodachiGames.Markdown.Editor
             var badge = new Label("📌") { style = { fontSize = 13, marginRight = 6 } };
             _title = new Label("PINNED")
             { style = { fontSize = 11, color = C_TEXT, unityFontStyleAndWeight = FontStyle.Bold, flexGrow = 1, letterSpacing = 1f, overflow = Overflow.Hidden, whiteSpace = WhiteSpace.NoWrap } };
-            _formatToggle = new Toggle("Formatted")
-            { value = true, style = { marginRight = 6, flexShrink = 0, color = C_TEXT, fontSize = 11 } };
-            _formatToggle.RegisterValueChangedCallback(_ => Render());
+            _mode = (ViewMode)SessionState.GetInt(ModeKey, (int)ViewMode.Formatted);
+            _modeDropdown = new DropdownField(ModeLabels.ToList(), (int)_mode)
+            { style = { marginRight = 6, flexShrink = 0, minWidth = 90 } };
+            _modeDropdown.RegisterValueChangedCallback(evt =>
+            {
+                _mode = (ViewMode)Array.IndexOf(ModeLabels, evt.newValue);
+                SessionState.SetInt(ModeKey, (int)_mode);
+                SaveScroll();
+                Render();
+            });
             var close = IconButton("✕", Close);
-            hdr.Add(badge); hdr.Add(_title); hdr.Add(_formatToggle); hdr.Add(close);
+            hdr.Add(badge); hdr.Add(_title); hdr.Add(_modeDropdown); hdr.Add(close);
             root.Add(hdr);
 
             // Tab bar (one tab per pinned file).
@@ -296,7 +322,15 @@ namespace KodachiGames.Markdown.Editor
         {
             if (_rawText == null) return;
 
-            if (_formatToggle == null || _formatToggle.value)
+            if (_mode == ViewMode.Tasks)
+            {
+                // Tasks grouped under headings, with completion % and priority sorting.
+                TaskView.Populate(_content, _rawText,
+                    _truncated ? null : ToggleCheckbox,
+                    _truncated ? null : SetPriority,
+                    _activeRel);
+            }
+            else if (_mode == ViewMode.Formatted)
             {
                 // Truncated/unreadable content renders read-only checkboxes (null callback).
                 MarkdownView.Populate(_content, _rawText, _truncated ? null : ToggleCheckbox);
@@ -329,9 +363,18 @@ namespace KodachiGames.Markdown.Editor
             }
 
             // Restore the saved scroll position (after layout, so content extents exist).
+            // SelectFile saves the outgoing file's offset; in-place re-renders save via
+            // SaveScroll() so ticking a box or switching mode doesn't jump to the top.
             var targetY = _scrollByRel.TryGetValue(_activeRel ?? "", out var y) ? y : 0f;
             _scroll.scrollOffset = new Vector2(0, targetY);
             _scroll.schedule.Execute(() => _scroll.scrollOffset = new Vector2(0, targetY));
+        }
+
+        /// <summary>Remember the current scroll offset so the next Render restores it in place.</summary>
+        void SaveScroll()
+        {
+            if (!string.IsNullOrEmpty(_activeRel))
+                _scrollByRel[_activeRel] = _scroll.scrollOffset.y;
         }
 
         void WriteRawText()
@@ -352,15 +395,32 @@ namespace KodachiGames.Markdown.Editor
         }
 
         static readonly Regex CheckboxMarker = new(@"\[[ xX]\]");
+        static readonly Regex PriorityMarker = new(@"\s*\{[Pp]:-?\d+\}");
 
         void ToggleCheckbox(int lineIndex, bool isChecked)
+        {
+            EditLine(lineIndex, line => CheckboxMarker.Replace(line, isChecked ? "[x]" : "[ ]", 1));
+        }
+
+        /// <summary>Rewrites the <c>{P:n}</c> marker on a task line (0 removes it, since 0 is the default).</summary>
+        void SetPriority(int lineIndex, int priority)
+        {
+            EditLine(lineIndex, line =>
+            {
+                line = PriorityMarker.Replace(line, "").TrimEnd();
+                return priority == 0 ? line : line + $" {{P:{priority}}}";
+            });
+        }
+
+        /// <summary>Applies <paramref name="transform"/> to one source line, persists, and re-renders in place.</summary>
+        void EditLine(int lineIndex, Func<string, string> transform)
         {
             if (string.IsNullOrEmpty(_activeRel) || _rawText == null) return;
 
             var lines = _rawText.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
             if (lineIndex < 0 || lineIndex >= lines.Length) return;
 
-            lines[lineIndex] = CheckboxMarker.Replace(lines[lineIndex], isChecked ? "[x]" : "[ ]", 1);
+            lines[lineIndex] = transform(lines[lineIndex]);
             _rawText = string.Join("\n", lines);
 
             var fullPath = MarkdownPins.ToFull(_activeRel);
@@ -377,9 +437,11 @@ namespace KodachiGames.Markdown.Editor
             }
             catch (Exception e)
             {
-                Debug.LogError($"Failed to write checkbox change to {_activeRel}: {e.Message}");
+                Debug.LogError($"Failed to write change to {_activeRel}: {e.Message}");
             }
 
+            // Keep the scroll position; in Tasks mode the list re-sorts under the cursor.
+            SaveScroll();
             Render();
         }
 
@@ -392,15 +454,17 @@ namespace KodachiGames.Markdown.Editor
                 e.StopPropagation();
                 Close();
             }
-            else if (e.keyCode == KeyCode.E && e.actionKey && _formatToggle != null)
+            else if (e.keyCode == KeyCode.E && e.actionKey && _modeDropdown != null)
             {
+                // Toggle between Formatted and Edit (leaves Tasks mode for Formatted).
                 e.StopPropagation();
-                _formatToggle.value = !_formatToggle.value;
+                var next = _mode == ViewMode.Edit ? ViewMode.Formatted : ViewMode.Edit;
+                _modeDropdown.value = ModeLabels[(int)next];
             }
             else if ((e.keyCode == KeyCode.Tab || e.keyCode == KeyCode.RightArrow || e.keyCode == KeyCode.LeftArrow)
                      && _tabs.Count > 1
                      // Don't steal arrow keys from the editable raw-text field.
-                     && (_formatToggle == null || _formatToggle.value))
+                     && _mode != ViewMode.Edit)
             {
                 e.StopPropagation();
                 CycleTab(e.keyCode == KeyCode.LeftArrow ? -1 : 1);
