@@ -338,6 +338,7 @@ namespace KodachiGames.Markdown.Editor
                     _truncated ? null : ReplaceLine,
                     _truncated ? null : InsertLinesAfter,
                     _truncated ? null : EditDescription,
+                    _truncated ? null : DeleteRange,
                     _activeRel);
             }
             else if (_mode == ViewMode.Formatted)
@@ -459,6 +460,16 @@ namespace KodachiGames.Markdown.Editor
             PersistAndRender();
         }
 
+        void DeleteRange(int fromLine, int toLine)
+        {
+            if (string.IsNullOrEmpty(_activeRel) || _rawText == null) return;
+            var lines = _rawText.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n').ToList();
+            var count = Math.Min(toLine, lines.Count - 1) - fromLine + 1;
+            if (count > 0) lines.RemoveRange(fromLine, count);
+            _rawText = string.Join("\n", lines);
+            PersistAndRender();
+        }
+
         void PersistAndRender()
         {
             if (string.IsNullOrEmpty(_activeRel)) return;
@@ -517,6 +528,8 @@ namespace KodachiGames.Markdown.Editor
         {
             if (e.keyCode == KeyCode.Escape)
             {
+                // Let the focused TextField handle Escape (cancel edit) before closing.
+                if (rootVisualElement.focusController?.focusedElement is TextField) return;
                 e.StopPropagation();
                 Close();
             }
