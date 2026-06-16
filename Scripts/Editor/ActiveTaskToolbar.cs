@@ -37,6 +37,8 @@ namespace KodachiGames.Markdown.Editor
         {
             var menu = new GenericMenu();
 
+            menu.AddItem(new GUIContent("Complete task"), false, ActiveTask.Complete);
+            menu.AddSeparator("");
             menu.AddItem(new GUIContent(ActiveTask.IsRunning ? "Pause timer" : "Resume timer"),
                 false, ActiveTask.TogglePause);
             menu.AddItem(new GUIContent("Reset timer"), false, ActiveTask.ResetTimer);

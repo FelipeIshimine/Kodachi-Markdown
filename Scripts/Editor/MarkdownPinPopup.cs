@@ -130,7 +130,14 @@ namespace KodachiGames.Markdown.Editor
         void OnActiveTaskChanged()
         {
             // Structural change (task set/cleared, paused) — refresh the Task view in place.
-            if (_mode == ViewMode.Tasks) { SaveScroll(); Render(); }
+            // Reload from disk first: Complete() may have modified the file.
+            if (_mode == ViewMode.Tasks)
+            {
+                SaveScroll();
+                if (!string.IsNullOrEmpty(_activeRel))
+                    LoadRawText(MarkdownPins.ToFull(_activeRel));
+                Render();
+            }
         }
 
         void OnPinsChanged()

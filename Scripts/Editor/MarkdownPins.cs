@@ -79,7 +79,12 @@ namespace KodachiGames.Markdown.Editor
             var raw = EditorPrefs.GetString(PrefKey, "");
             if (string.IsNullOrEmpty(raw))
                 return new List<string>();
-            return raw.Split('\n').Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
+
+            var list = raw.Split('\n').Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
+            var pruned = list.Where(p => File.Exists(ToFull(p))).ToList();
+            if (pruned.Count != list.Count)
+                Save(pruned);
+            return pruned;
         }
 
         static void Save(List<string> list)

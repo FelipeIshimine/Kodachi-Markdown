@@ -72,6 +72,51 @@ namespace KodachiGames.Markdown.Editor
             Notify();
         }
 
+        // Mirrors the cleaning pipeline in TaskView.Parse so we can match stored text back to raw lines.
+        static readonly System.Text.RegularExpressions.Regex _reCheckbox  = new(@"^(\s*[-*+]\s+)\[[ ]\]\s+(.*)$");
+        static readonly System.Text.RegularExpressions.Regex _rePriority  = new(@"\{[Pp]:-?\d+\}");
+        static readonly System.Text.RegularExpressions.Regex _reInlineCode = new("`([^`]+)`");
+        static readonly System.Text.RegularExpressions.Regex _reEmphasis  = new(@"(\*\*|\*)(.+?)\1");
+        static readonly System.Text.RegularExpressions.Regex _reLink      = new(@"\[([^\]]+)\]\(([^)]+)\)");
+
+        static string CleanTaskText(string raw)
+        {
+            raw = _rePriority.Replace(raw, "").Trim();
+            raw = _reInlineCode.Replace(raw, "$1");
+            raw = _reLink.Replace(raw, "$1");
+            raw = _reEmphasis.Replace(raw, "$2");
+            return raw;
+        }
+
+        /// <summary>
+        /// Marks the active task's checkbox as [x] in the source file, then clears the active task.
+        /// </summary>
+        public static void Complete()
+        {
+            if (!HasActive) return;
+
+            var fullPath = MarkdownPins.ToFull(Rel);
+            if (System.IO.File.Exists(fullPath))
+            {
+                var text = System.IO.File.ReadAllText(fullPath);
+                var lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+
+                var taskText = Text;
+                for (var i = 0; i < lines.Length; i++)
+                {
+                    var m = _reCheckbox.Match(lines[i]);
+                    if (!m.Success) continue;
+                    if (!string.Equals(CleanTaskText(m.Groups[2].Value), taskText, System.StringComparison.Ordinal)) continue;
+
+                    lines[i] = m.Groups[1].Value + "[x] " + m.Groups[2].Value;
+                    System.IO.File.WriteAllText(fullPath, string.Join("\n", lines));
+                    break;
+                }
+            }
+
+            Clear();
+        }
+
         public static void Pause()
         {
             if (!IsRunning) return;
