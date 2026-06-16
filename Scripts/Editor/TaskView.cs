@@ -17,56 +17,80 @@ namespace KodachiGames.Markdown.Editor
     /// Within a heading, tasks are ordered uncompleted-first, then by descending priority.
     /// Like <see cref="MarkdownView"/>, every label keeps rich text disabled to avoid the
     /// TextCore rich-text measuring crash.
+    ///
+    /// Indented lines following a task are parsed as subtasks (if they are checkboxes) or
+    /// as a description (plain text), displayed below the task row.
     /// </summary>
     public static class TaskView
     {
-        static readonly Regex Heading  = new(@"^(#{1,6})\s+(.*)$", RegexOptions.Compiled);
-        static readonly Regex Checkbox = new(@"^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$", RegexOptions.Compiled);
-        static readonly Regex Priority = new(@"\{[Pp]:(-?\d+)\}", RegexOptions.Compiled);
+        static readonly Regex Heading    = new(@"^(#{1,6})\s+(.*)$", RegexOptions.Compiled);
+        static readonly Regex Checkbox   = new(@"^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$", RegexOptions.Compiled);
+        static readonly Regex Priority   = new(@"\{[Pp]:(-?\d+)\}", RegexOptions.Compiled);
         static readonly Regex InlineCode = new("`([^`]+)`", RegexOptions.Compiled);
-        static readonly Regex Emphasis  = new(@"(\*\*|\*)(.+?)\1", RegexOptions.Compiled);
-        static readonly Regex Link      = new(@"\[([^\]]+)\]\(([^)]+)\)", RegexOptions.Compiled);
+        static readonly Regex Emphasis   = new(@"(\*\*|\*)(.+?)\1", RegexOptions.Compiled);
+        static readonly Regex Link       = new(@"\[([^\]]+)\]\(([^)]+)\)", RegexOptions.Compiled);
 
-        static readonly Color MutedColor = new(1f, 1f, 1f, 0.55f);
+        static readonly Color MutedColor  = new(1f, 1f, 1f, 0.55f);
         static readonly Color AccentColor = new(0.255f, 0.490f, 0.965f);
-        static readonly Color DoneColor = new(0.45f, 0.78f, 0.45f);
+        static readonly Color DoneColor   = new(0.45f, 0.78f, 0.45f);
 
         sealed class Task
         {
-            public int Line;       // source line index, for write-back
+            public int Line;                              // source line index
+            public int LastLine;                          // last consumed line (subtasks/description)
             public bool Done;
             public int Priority;
-            public string Text;
+            public string Text;                           // cleaned display text
+            public string RawLine;                        // original source line, for write-back
+            public string Description;                    // joined plain-text continuation
+            public readonly List<int> DescriptionLines = new();  // source line indices of description
+            public readonly List<Task> Subtasks = new();
         }
 
         sealed class Section
         {
-            public string Title;   // null for tasks before the first heading
+            public string Title;
             public int Level;
+            public int HeadingLine = -1;                  // -1 for the implicit root section
             public readonly List<Task> Tasks = new();
+
+            /// <summary>Last source line that belongs to this section (for insert-after).</summary>
+            public int DocumentLastLine => Tasks.Count > 0
+                ? Tasks.OrderBy(t => t.Line).Last().LastLine
+                : HeadingLine;
         }
 
-        /// <param name="onToggled">
-        /// Invoked when a task checkbox is clicked, with the zero-based source line index and
-        /// the new checked state. Pass <c>null</c> to render read-only (e.g. truncated source).
+        // ── Public API ──────────────────────────────────────────────────────────────
+
+        /// <param name="onToggled">Checkbox toggled (lineIndex, newValue).</param>
+        /// <param name="onSetPriority">Priority changed via right-click (lineIndex, priority).</param>
+        /// <param name="onReplaceLine">Replace one raw source line (lineIndex, newRawLine).</param>
+        /// <param name="onInsertAfter">Insert raw source lines after a line (lineIndex, newLines).</param>
+        /// <param name="onEditDescription">
+        /// Replace description for a task (taskLineIndex, descLineIndices, newDescriptionText).
+        /// Pass empty descLineIndices to add a new description.
         /// </param>
-        /// <param name="onSetPriority">
-        /// Invoked from a task's right-click menu with the source line index and the chosen
-        /// priority (0–5). Pass <c>null</c> to omit the menu (e.g. truncated source).
-        /// </param>
-        /// <param name="fileRel">
-        /// Rel-path of the file being shown, used to match/set the global <see cref="ActiveTask"/>.
-        /// </param>
+        /// <param name="fileRel">Rel-path used for ActiveTask matching.</param>
         public static void Populate(VisualElement container, string markdown,
-            Action<int, bool> onToggled = null, Action<int, int> onSetPriority = null, string fileRel = null)
+            Action<int, bool> onToggled = null,
+            Action<int, int> onSetPriority = null,
+            Action<int, string> onReplaceLine = null,
+            Action<int, string[]> onInsertAfter = null,
+            Action<int, int[], string> onEditDescription = null,
+            string fileRel = null)
         {
             container.Clear();
             if (string.IsNullOrEmpty(markdown)) return;
 
-            var sections = Parse(markdown);
-            var withTasks = sections.Where(s => s.Tasks.Count > 0).ToList();
+            var (sections, totalLines) = Parse(markdown);
+            var editable = onInsertAfter != null;
 
-            if (withTasks.Count == 0)
+            // Active task banner (belongs to this file).
+            if (fileRel != null && ActiveTask.HasActive && ActiveTask.Rel == fileRel)
+                container.Add(ActiveCard());
+
+            var anyTasks = sections.Any(s => s.Tasks.Count > 0);
+            if (!anyTasks && !editable)
             {
                 var empty = PlainLabel("No tasks found.\n\nAdd a line like \"- [ ] Do the thing {P:1}\".");
                 empty.style.color = MutedColor;
@@ -75,30 +99,37 @@ namespace KodachiGames.Markdown.Editor
                 return;
             }
 
-            // The active task, when it belongs to this file, is pinned as a highlighted card.
-            if (fileRel != null && ActiveTask.HasActive && ActiveTask.Rel == fileRel)
-                container.Add(ActiveCard());
-
-            foreach (var section in withTasks)
+            foreach (var section in sections)
             {
-                container.Add(SectionHeader(section));
+                if (!editable && section.Tasks.Count == 0) continue;
 
-                // Uncompleted first; higher priority breaks ties. OrderBy is stable, so
-                // equal-priority tasks keep their document order.
+                // Section heading (skip null-title root if it has no tasks and a heading exists later).
+                if (section.Title != null || section.Tasks.Count > 0)
+                    container.Add(SectionHeader(section));
+
                 var ordered = section.Tasks
                     .OrderBy(t => t.Done)
                     .ThenByDescending(t => t.Priority);
 
                 foreach (var task in ordered)
-                    container.Add(TaskRow(task, onToggled, onSetPriority, fileRel));
+                    container.Add(TaskRow(task, onToggled, onSetPriority,
+                        onReplaceLine, onEditDescription, fileRel));
+
+                if (editable)
+                    container.Add(AddTaskFooter(section, onInsertAfter));
             }
+
+            if (editable)
+                container.Add(AddSectionFooter(totalLines, onInsertAfter));
         }
 
-        static List<Section> Parse(string markdown)
+        // ── Parse ───────────────────────────────────────────────────────────────────
+
+        static (List<Section> sections, int totalLines) Parse(string markdown)
         {
             var lines = markdown.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
             var sections = new List<Section>();
-            var current = new Section { Title = null, Level = 0 };
+            var current = new Section { Title = null, HeadingLine = -1 };
             sections.Add(current);
 
             var inFence = false;
@@ -111,7 +142,12 @@ namespace KodachiGames.Markdown.Editor
                 var h = Heading.Match(line);
                 if (h.Success)
                 {
-                    current = new Section { Title = Clean(h.Groups[2].Value).Trim(), Level = h.Groups[1].Value.Length };
+                    current = new Section
+                    {
+                        Title = Clean(h.Groups[2].Value).Trim(),
+                        Level = h.Groups[1].Value.Length,
+                        HeadingLine = i,
+                    };
                     sections.Add(current);
                     continue;
                 }
@@ -126,23 +162,65 @@ namespace KodachiGames.Markdown.Editor
                     priority = parsed;
                 text = Priority.Replace(text, "").Trim();
 
-                current.Tasks.Add(new Task
+                var task = new Task
                 {
                     Line = i,
+                    LastLine = i,
                     Done = c.Groups[2].Value is "x" or "X",
                     Priority = priority,
                     Text = Clean(text),
-                });
+                    RawLine = line,
+                };
+
+                // Consume indented continuation lines.
+                var parentIndent = c.Groups[1].Value.Length;
+                var descLines = new List<string>();
+                while (i + 1 < lines.Length)
+                {
+                    var next = lines[i + 1];
+                    if (string.IsNullOrWhiteSpace(next)) break;
+                    var nextIndent = next.Length - next.TrimStart('\t', ' ').Length;
+                    if (nextIndent <= parentIndent) break;
+
+                    i++;
+                    task.LastLine = i;
+
+                    var sub = Checkbox.Match(next);
+                    if (sub.Success)
+                    {
+                        var subText = sub.Groups[3].Value;
+                        var subPriority = 0;
+                        var sp = Priority.Match(subText);
+                        if (sp.Success && int.TryParse(sp.Groups[1].Value, out var subParsed))
+                            subPriority = subParsed;
+                        subText = Priority.Replace(subText, "").Trim();
+                        task.Subtasks.Add(new Task
+                        {
+                            Line = i, LastLine = i,
+                            Done = sub.Groups[2].Value is "x" or "X",
+                            Priority = subPriority,
+                            Text = Clean(subText),
+                            RawLine = next,
+                        });
+                    }
+                    else
+                    {
+                        descLines.Add(next.TrimStart());
+                        task.DescriptionLines.Add(i);
+                    }
+                }
+
+                if (descLines.Count > 0)
+                    task.Description = string.Join("\n", descLines);
+
+                current.Tasks.Add(task);
             }
 
-            return sections;
+            return (sections, lines.Length - 1);
         }
 
-        /// <summary>
-        /// Highlighted banner for the active task: name, a live (self-ticking) timer, and a
-        /// pause/resume button. Reads <see cref="ActiveTask"/> live so it reflects changes made
-        /// from the toolbar without a full re-render.
-        /// </summary>
+        // ── Active task card ─────────────────────────────────────────────────────────
+
         static VisualElement ActiveCard()
         {
             var card = new VisualElement
@@ -182,7 +260,7 @@ namespace KodachiGames.Markdown.Editor
             controls.Add(timer);
 
             var pause = new Button { style = { marginLeft = 4 } };
-            pause.clicked += () => { ActiveTask.TogglePause(); };
+            pause.clicked += () => ActiveTask.TogglePause();
             controls.Add(pause);
 
             var clear = new Button(ActiveTask.Clear) { text = "Clear", style = { marginLeft = 2 } };
@@ -197,21 +275,17 @@ namespace KodachiGames.Markdown.Editor
                 pause.text = ActiveTask.IsRunning ? "⏸ Pause" : "▶ Resume";
             }
             Tick();
-            // Auto-stops when the element leaves the panel (tab switch / re-render).
             card.schedule.Execute(Tick).Every(500);
-
             return card;
         }
+
+        // ── Section header ───────────────────────────────────────────────────────────
 
         static VisualElement SectionHeader(Section section)
         {
             var row = new VisualElement
             {
-                style =
-                {
-                    flexDirection = FlexDirection.Row, alignItems = Align.Center,
-                    marginTop = 8, marginBottom = 4
-                }
+                style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginTop = 8, marginBottom = 4 }
             };
 
             var title = PlainLabel(string.IsNullOrEmpty(section.Title) ? "Tasks" : section.Title);
@@ -220,60 +294,109 @@ namespace KodachiGames.Markdown.Editor
             title.style.flexGrow = 1;
             row.Add(title);
 
-            var done = section.Tasks.Count(t => t.Done);
-            var pct = Mathf.RoundToInt(100f * done / section.Tasks.Count);
-            var badge = PlainLabel($"{pct}%  ({done}/{section.Tasks.Count})");
-            badge.style.flexShrink = 0;
-            badge.style.color = pct == 100 ? DoneColor : MutedColor;
-            badge.style.unityFontStyleAndWeight = FontStyle.Bold;
-            row.Add(badge);
+            if (section.Tasks.Count > 0)
+            {
+                var done = section.Tasks.Count(t => t.Done);
+                var pct  = Mathf.RoundToInt(100f * done / section.Tasks.Count);
+                var badge = PlainLabel($"{pct}%  ({done}/{section.Tasks.Count})");
+                badge.style.flexShrink = 0;
+                badge.style.color = pct == 100 ? DoneColor : MutedColor;
+                badge.style.unityFontStyleAndWeight = FontStyle.Bold;
+                row.Add(badge);
+            }
 
             return row;
         }
 
+        // ── Task row ─────────────────────────────────────────────────────────────────
+
         const int MaxPriority = 5;
 
-        static VisualElement TaskRow(Task task, Action<int, bool> onToggled, Action<int, int> onSetPriority, string fileRel)
+        static VisualElement TaskRow(Task task,
+            Action<int, bool> onToggled,
+            Action<int, int> onSetPriority,
+            Action<int, string> onReplaceLine,
+            Action<int, int[], string> onEditDescription,
+            string fileRel)
         {
             var isActive = fileRel != null && ActiveTask.IsActive(fileRel, task.Text);
 
-            var row = new VisualElement
+            var wrapper = new VisualElement
             {
                 style =
                 {
-                    flexDirection = FlexDirection.Row, alignItems = Align.FlexStart,
-                    marginLeft = 12, marginBottom = 2,
+                    marginLeft = 12, marginBottom = 4,
                     paddingLeft = 4, paddingTop = 1, paddingBottom = 1,
                     borderTopLeftRadius = 3, borderBottomLeftRadius = 3,
-                    backgroundColor = isActive ? new Color(AccentColor.r, AccentColor.g, AccentColor.b, 0.18f) : Color.clear
+                    backgroundColor = isActive
+                        ? new Color(AccentColor.r, AccentColor.g, AccentColor.b, 0.18f)
+                        : Color.clear
                 }
             };
 
-            // Right-click a task: set priority (0–5; 0 clears the {P:n} marker) and pick the
-            // active task. Priority entries need the write-back callback; the active-task
-            // entries only need the file rel-path.
+            var row = new VisualElement
+            {
+                style = { flexDirection = FlexDirection.Row, alignItems = Align.FlexStart }
+            };
+
             row.AddManipulator(new ContextualMenuManipulator(evt =>
             {
+                // Priority submenu
                 if (onSetPriority != null)
                 {
                     var line = task.Line;
-                    var current = task.Priority;
-                    for (var p = 0; p <= MaxPriority; p++)
+                    var cur  = task.Priority;
+                    for (var pp = 0; pp <= MaxPriority; pp++)
                     {
-                        var value = p;
+                        var value = pp;
                         evt.menu.AppendAction(
-                            p == 0 ? "Priority/0 (none)" : $"Priority/{p}",
+                            pp == 0 ? "Priority/0 (none)" : $"Priority/{pp}",
                             _ => onSetPriority(line, value),
-                            current == value ? DropdownMenuAction.Status.Checked : DropdownMenuAction.Status.Normal);
+                            cur == value ? DropdownMenuAction.Status.Checked : DropdownMenuAction.Status.Normal);
                     }
                 }
 
+                // Active task
                 if (fileRel != null)
                 {
                     if (isActive)
                         evt.menu.AppendAction("Clear Active Task", _ => ActiveTask.Clear());
                     else
                         evt.menu.AppendAction("Set as Active Task", _ => ActiveTask.Set(fileRel, task.Text));
+                }
+
+                // Rename
+                if (onReplaceLine != null)
+                {
+                    evt.menu.AppendSeparator();
+                    evt.menu.AppendAction("Rename task", _ =>
+                    {
+                        var label = row.Q<Label>();
+                        if (label != null) BeginInlineEdit(label, row, task.Text,
+                            newText => CommitRename(task, newText, onReplaceLine));
+                    });
+                }
+
+                // Description
+                if (onEditDescription != null)
+                {
+                    if (string.IsNullOrEmpty(task.Description))
+                    {
+                        evt.menu.AppendAction("Add description", _ =>
+                            BeginDescriptionEdit(wrapper, task, "", onEditDescription));
+                    }
+                    else
+                    {
+                        evt.menu.AppendAction("Edit description", _ =>
+                        {
+                            var descLabel = wrapper.Q<Label>(DescLabelName);
+                            if (descLabel != null)
+                                BeginInlineEdit(descLabel, wrapper, task.Description,
+                                    newText => CommitDescription(task, newText, onEditDescription));
+                            else
+                                BeginDescriptionEdit(wrapper, task, task.Description, onEditDescription);
+                        });
+                    }
                 }
             }));
 
@@ -289,9 +412,148 @@ namespace KodachiGames.Markdown.Editor
             if (task.Priority != 0)
                 row.Add(PriorityBadge(task.Priority));
 
-            var label = PlainLabel(task.Text);
-            label.style.flexGrow = 1;
+            var taskLabel = PlainLabel(task.Text);
+            taskLabel.style.flexGrow = 1;
             if (task.Done)
+            {
+                taskLabel.style.color = MutedColor;
+                taskLabel.style.unityFontStyleAndWeight = FontStyle.Italic;
+            }
+
+            // Double-click to rename
+            if (onReplaceLine != null)
+            {
+                taskLabel.RegisterCallback<MouseDownEvent>(e =>
+                {
+                    if (e.clickCount == 2)
+                    {
+                        e.StopPropagation();
+                        BeginInlineEdit(taskLabel, row, task.Text,
+                            newText => CommitRename(task, newText, onReplaceLine));
+                    }
+                });
+            }
+
+            row.Add(taskLabel);
+            wrapper.Add(row);
+
+            // Description
+            if (!string.IsNullOrEmpty(task.Description))
+            {
+                var descLabel = PlainLabel(task.Description);
+                descLabel.name = DescLabelName;
+                descLabel.style.color = MutedColor;
+                descLabel.style.fontSize = 11;
+                descLabel.style.marginLeft = 40;
+                descLabel.style.marginTop = 1;
+                descLabel.style.marginBottom = 2;
+
+                if (onEditDescription != null)
+                {
+                    descLabel.RegisterCallback<MouseDownEvent>(e =>
+                    {
+                        if (e.clickCount == 2)
+                        {
+                            e.StopPropagation();
+                            BeginInlineEdit(descLabel, wrapper, task.Description,
+                                newText => CommitDescription(task, newText, onEditDescription));
+                        }
+                    });
+                }
+
+                wrapper.Add(descLabel);
+            }
+
+            foreach (var sub in task.Subtasks)
+                wrapper.Add(SubtaskRow(sub, onToggled));
+
+            return wrapper;
+        }
+
+        const string DescLabelName = "__desc_label";
+
+        static void CommitRename(Task task, string newText, Action<int, string> onReplaceLine)
+        {
+            if (newText == null || newText.Trim() == task.Text) return;
+            newText = newText.Trim();
+            if (string.IsNullOrEmpty(newText)) return;
+
+            // Rebuild the raw line: preserve indent, bullet, checkbox state, and priority marker.
+            var m = Checkbox.Match(task.RawLine);
+            if (!m.Success) return;
+            var prefix = task.RawLine.Substring(0, m.Groups[3].Index);
+            var priorityMatch = Priority.Match(m.Groups[3].Value);
+            var prioritySuffix = priorityMatch.Success ? " " + priorityMatch.Value : "";
+            onReplaceLine(task.Line, prefix + newText + prioritySuffix);
+        }
+
+        static void CommitDescription(Task task, string newText, Action<int, int[], string> onEditDescription)
+        {
+            if (newText == null) return;
+            onEditDescription(task.Line, task.DescriptionLines.ToArray(), newText.Trim());
+        }
+
+        static void BeginDescriptionEdit(VisualElement wrapper, Task task, string initial,
+            Action<int, int[], string> onEditDescription)
+        {
+            // Find the description label slot (after the main row, before subtasks).
+            var descLabel = wrapper.Q<Label>(DescLabelName);
+            if (descLabel != null)
+                BeginInlineEdit(descLabel, wrapper, initial,
+                    newText => CommitDescription(task, newText, onEditDescription));
+            else
+            {
+                // No description yet — inject a temporary TextField after the first row.
+                var field = new TextField { value = initial, multiline = true };
+                field.style.marginLeft = 22;
+                field.style.marginTop = 2;
+                field.style.marginBottom = 2;
+                field.style.flexGrow = 1;
+
+                var committed = false;
+                void Commit(string val)
+                {
+                    if (committed) return;
+                    committed = true;
+                    CommitDescription(task, val ?? "", onEditDescription);
+                }
+                field.RegisterCallback<KeyDownEvent>(e =>
+                {
+                    if ((e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter) && !e.shiftKey)
+                    { e.StopPropagation(); Commit(field.value); }
+                    else if (e.keyCode == KeyCode.Escape)
+                    { e.StopPropagation(); Commit(null); }
+                });
+                field.RegisterCallback<FocusOutEvent>(_ => Commit(field.value));
+
+                // Insert after the main task row (index 0).
+                wrapper.Insert(1, field);
+                wrapper.schedule.Execute(() => { field.Focus(); }).StartingIn(10);
+            }
+        }
+
+        // ── Subtask row ──────────────────────────────────────────────────────────────
+
+        static VisualElement SubtaskRow(Task sub, Action<int, bool> onToggled)
+        {
+            var row = new VisualElement
+            {
+                style = { flexDirection = FlexDirection.Row, alignItems = Align.FlexStart, marginLeft = 22, marginBottom = 1 }
+            };
+
+            var toggle = new Toggle { value = sub.Done, style = { marginRight = 4, marginTop = 1 } };
+            toggle.SetEnabled(onToggled != null);
+            if (onToggled != null)
+            {
+                var line = sub.Line;
+                toggle.RegisterValueChangedCallback(evt => onToggled(line, evt.newValue));
+            }
+            row.Add(toggle);
+
+            var label = PlainLabel(sub.Text);
+            label.style.flexGrow = 1;
+            label.style.fontSize = 12;
+            if (sub.Done)
             {
                 label.style.color = MutedColor;
                 label.style.unityFontStyleAndWeight = FontStyle.Italic;
@@ -299,6 +561,118 @@ namespace KodachiGames.Markdown.Editor
             row.Add(label);
             return row;
         }
+
+        // ── Add task / Add section footers ────────────────────────────────────────────
+
+        static VisualElement AddTaskFooter(Section section, Action<int, string[]> onInsertAfter)
+        {
+            var footer = new VisualElement
+            {
+                style = { flexDirection = FlexDirection.Row, marginLeft = 12, marginTop = 2, marginBottom = 6 }
+            };
+
+            Button btn = null;
+            btn = MutedButton("+ Add task", () =>
+            {
+                footer.Clear();
+                ShowInlineInsert(footer, btn,
+                    val => onInsertAfter(section.DocumentLastLine, new[] { "- [ ] " + val }));
+            });
+            footer.Add(btn);
+            return footer;
+        }
+
+        static VisualElement AddSectionFooter(int totalLines, Action<int, string[]> onInsertAfter)
+        {
+            var footer = new VisualElement
+            {
+                style = { marginTop = 8, marginBottom = 4, marginLeft = 4 }
+            };
+
+            Button btn = null;
+            btn = MutedButton("+ Add section", () =>
+            {
+                footer.Clear();
+                ShowInlineInsert(footer, btn,
+                    val => onInsertAfter(totalLines, new[] { "", "## " + val }));
+            });
+            footer.Add(btn);
+            return footer;
+        }
+
+        /// <summary>
+        /// Replaces <paramref name="footer"/>'s content with a TextField; on commit calls
+        /// <paramref name="onCommit"/> with the trimmed value, or restores <paramref name="restoreBtn"/>
+        /// if cancelled or empty.
+        /// </summary>
+        static void ShowInlineInsert(VisualElement footer, Button restoreBtn, Action<string> onCommit)
+        {
+            var field = new TextField();
+            field.style.flexGrow = 1;
+            footer.Add(field);
+
+            var committed = false;
+            void Commit(string val)
+            {
+                if (committed) return;
+                committed = true;
+                val = val?.Trim();
+                if (!string.IsNullOrEmpty(val))
+                    onCommit(val);
+                else
+                {
+                    footer.Clear();
+                    footer.Add(restoreBtn);
+                }
+            }
+
+            field.RegisterCallback<KeyDownEvent>(e =>
+            {
+                if (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter)
+                { e.StopPropagation(); Commit(field.value); }
+                else if (e.keyCode == KeyCode.Escape)
+                { e.StopPropagation(); Commit(null); }
+            });
+            field.RegisterCallback<FocusOutEvent>(_ => Commit(field.value));
+            footer.schedule.Execute(() => field.Focus()).StartingIn(10);
+        }
+
+        // ── Inline edit helper ───────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Swaps <paramref name="label"/> for a TextField in-place; on commit/cancel calls
+        /// <paramref name="onCommit"/> with the new text (or <c>null</c> on Escape).
+        /// The caller's callback is responsible for triggering a re-render.
+        /// </summary>
+        static void BeginInlineEdit(Label label, VisualElement parent, string initial, Action<string> onCommit)
+        {
+            var field = new TextField { value = initial, multiline = label.style.whiteSpace == WhiteSpace.Normal };
+            field.style.flexGrow = 1;
+
+            var idx = parent.IndexOf(label);
+            parent.RemoveAt(idx);
+            parent.Insert(idx, field);
+
+            var committed = false;
+            void Commit(string val)
+            {
+                if (committed) return;
+                committed = true;
+                onCommit(val);
+            }
+
+            field.RegisterCallback<KeyDownEvent>(e =>
+            {
+                if ((e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter) && !e.shiftKey)
+                { e.StopPropagation(); Commit(field.value); }
+                else if (e.keyCode == KeyCode.Escape)
+                { e.StopPropagation(); Commit(null); }
+            });
+            field.RegisterCallback<FocusOutEvent>(_ => Commit(field.value));
+            parent.schedule.Execute(() => { field.Focus(); field.SelectAll(); }).StartingIn(10);
+        }
+
+        // ── Visual helpers ───────────────────────────────────────────────────────────
 
         static VisualElement PriorityBadge(int priority)
         {
@@ -313,6 +687,29 @@ namespace KodachiGames.Markdown.Editor
                 badge.style.borderBottomLeftRadius = badge.style.borderBottomRightRadius = 3;
             badge.style.flexShrink = 0;
             return badge;
+        }
+
+        static Button MutedButton(string text, Action onClick)
+        {
+            var btn = new Button(onClick) { text = text };
+            btn.style.fontSize = 11;
+            btn.style.color = MutedColor;
+            btn.style.backgroundColor = new Color(0, 0, 0, 0);
+            btn.style.borderTopWidth = btn.style.borderRightWidth =
+                btn.style.borderBottomWidth = btn.style.borderLeftWidth = 0;
+            btn.style.paddingLeft = btn.style.paddingRight = 4;
+            btn.style.paddingTop = btn.style.paddingBottom = 2;
+            btn.RegisterCallback<PointerEnterEvent>(_ =>
+            {
+                btn.style.color = Color.white;
+                btn.style.backgroundColor = new Color(AccentColor.r, AccentColor.g, AccentColor.b, 0.15f);
+            });
+            btn.RegisterCallback<PointerLeaveEvent>(_ =>
+            {
+                btn.style.color = MutedColor;
+                btn.style.backgroundColor = new Color(0, 0, 0, 0);
+            });
+            return btn;
         }
 
         static Label PlainLabel(string text)

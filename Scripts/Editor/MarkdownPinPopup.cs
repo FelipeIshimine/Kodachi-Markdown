@@ -335,6 +335,9 @@ namespace KodachiGames.Markdown.Editor
                 TaskView.Populate(_content, _rawText,
                     _truncated ? null : ToggleCheckbox,
                     _truncated ? null : SetPriority,
+                    _truncated ? null : ReplaceLine,
+                    _truncated ? null : InsertLinesAfter,
+                    _truncated ? null : EditDescription,
                     _activeRel);
             }
             else if (_mode == ViewMode.Formatted)
@@ -417,6 +420,62 @@ namespace KodachiGames.Markdown.Editor
                 line = PriorityMarker.Replace(line, "").TrimEnd();
                 return priority == 0 ? line : line + $" {{P:{priority}}}";
             });
+        }
+
+        void ReplaceLine(int lineIndex, string newRawLine) =>
+            EditLine(lineIndex, _ => newRawLine);
+
+        void InsertLinesAfter(int lineIndex, string[] newLines)
+        {
+            if (string.IsNullOrEmpty(_activeRel) || _rawText == null) return;
+            var lines = _rawText.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n').ToList();
+            var insertAt = Math.Min(lineIndex + 1, lines.Count);
+            lines.InsertRange(insertAt, newLines);
+            _rawText = string.Join("\n", lines);
+            PersistAndRender();
+        }
+
+        void EditDescription(int taskLine, int[] descLineIndices, string newDescription)
+        {
+            if (string.IsNullOrEmpty(_activeRel) || _rawText == null) return;
+            var lines = _rawText.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n').ToList();
+
+            // Remove old description lines in reverse order to keep indices valid.
+            foreach (var idx in descLineIndices.OrderByDescending(x => x))
+                if (idx >= 0 && idx < lines.Count)
+                    lines.RemoveAt(idx);
+
+            // Insert new description lines (each prefixed with a tab) after the task line.
+            if (!string.IsNullOrWhiteSpace(newDescription))
+            {
+                var newDescLines = newDescription.Split('\n')
+                    .Select(l => "\t" + l.TrimStart())
+                    .ToArray();
+                var insertAt = Math.Min(taskLine + 1, lines.Count);
+                lines.InsertRange(insertAt, newDescLines);
+            }
+
+            _rawText = string.Join("\n", lines);
+            PersistAndRender();
+        }
+
+        void PersistAndRender()
+        {
+            if (string.IsNullOrEmpty(_activeRel)) return;
+            var fullPath = MarkdownPins.ToFull(_activeRel);
+            try
+            {
+                File.WriteAllText(fullPath, _rawText);
+                var dataPath = Application.dataPath.Replace('\\', '/');
+                if (fullPath.StartsWith(dataPath + "/", StringComparison.OrdinalIgnoreCase))
+                    AssetDatabase.ImportAsset("Assets" + fullPath.Substring(dataPath.Length));
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"Failed to write {_activeRel}: {e.Message}");
+            }
+            SaveScroll();
+            Render();
         }
 
         /// <summary>Applies <paramref name="transform"/> to one source line, persists, and re-renders in place.</summary>
