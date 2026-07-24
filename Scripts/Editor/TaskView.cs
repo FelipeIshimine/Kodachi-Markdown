@@ -139,7 +139,276 @@ namespace KodachiGames.Markdown.Editor
             }
 
             if (editable)
+            {
                 container.Add(AddSectionFooter(totalLines, cb.OnInsertAfter));
+                container.Add(KeyHint());
+
+                // Keyboard focus lives permanently on the *container* — the one element that survives
+                // every rebuild. Selection is plain data (_selectedLine) painted onto whichever row
+                // currently owns that source line, so an edit that rebuilds the tree never loses the
+                // cursor: we just re-highlight and (if needed) refocus the same stable container.
+                container.focusable = true;
+                container.AddToClassList(ListClass);
+
+                // Controllers resolve the selected row's Task at event time. The container survives
+                // rebuilds, so drop the previous handlers before adding fresh ones (which capture this
+                // Populate's cb/totalLines); otherwise they'd accumulate.
+                if (_kbdHandler != null) container.UnregisterCallback(_kbdHandler, TrickleDown.TrickleDown);
+                _kbdHandler = e => OnRowKey(e, container, cb, totalLines);
+                container.RegisterCallback(_kbdHandler, TrickleDown.TrickleDown);
+
+                // Row-to-row movement rides the system's navigation (arrows / d-pad / stick) rather
+                // than intercepting raw arrow KeyDownEvents, so we cooperate with the focus ring
+                // instead of racing it. Listen on bubble-up, as Unity recommends for navigation events.
+                if (_navHandler != null) container.UnregisterCallback(_navHandler);
+                _navHandler = e => OnRowNav(e, container);
+                container.RegisterCallback(_navHandler);
+
+                // Normalise the remembered selection to a row that still exists (exact line, else the
+                // nearest row at or before it, else the first), then paint it. This keeps the cursor
+                // sensible after an edit shifted line numbers (e.g. a delete).
+                var rows = Rows(container);
+                if (rows.Count > 0)
+                {
+                    if (rows.All(r => ((Task)r.userData).Line != _selectedLine))
+                    {
+                        var below = rows.Where(r => ((Task)r.userData).Line <= _selectedLine).ToList();
+                        var pick = below.Count > 0 ? below[^1] : rows[0];
+                        _selectedLine = ((Task)pick.userData).Line;
+                    }
+                    Rehighlight(container);
+                }
+
+                // Keep the keyboard alive across rebuilds: if nothing is being edited (no TextField
+                // focused), pull focus back onto the container.
+                if (container.focusController?.focusedElement is not TextField)
+                    FocusWhenReady(container);
+            }
+        }
+
+        // ── Keyboard controller ────────────────────────────────────────────────────────
+
+        static List<VisualElement> Rows(VisualElement container) =>
+            container.Query<VisualElement>(className: RowClass).ToList();
+
+        /// <summary>
+        /// Focus the container reliably. Calling <c>Focus()</c> immediately after a rebuild is racy in
+        /// an EditorWindow — the element may not be laid out yet and focus silently drops to null.
+        /// Focusing again on the first <see cref="GeometryChangedEvent"/> (once it's positioned) is the
+        /// canonical fix; the immediate call covers the already-laid-out case.
+        /// </summary>
+        static void FocusWhenReady(VisualElement element)
+        {
+            void Once(GeometryChangedEvent _)
+            {
+                element.UnregisterCallback<GeometryChangedEvent>(Once);
+                element.Focus();
+            }
+            element.RegisterCallback<GeometryChangedEvent>(Once);
+            element.Focus();
+        }
+
+        // ── Selection (plain data, decoupled from focus) ─────────────────────────────
+
+        /// <summary>The row that currently owns <see cref="_selectedLine"/>, or null.</summary>
+        static VisualElement CurrentRow(VisualElement container) =>
+            Rows(container).FirstOrDefault(r => ((Task)r.userData).Line == _selectedLine);
+
+        static Task CurrentTask(VisualElement container) =>
+            CurrentRow(container)?.userData as Task;
+
+        /// <summary>Paint the selection tint on the selected row and the active/clear colour on the rest.</summary>
+        static void Rehighlight(VisualElement container)
+        {
+            foreach (var r in Rows(container))
+            {
+                var line = ((Task)r.userData).Line;
+                r.style.backgroundColor = line == _selectedLine
+                    ? FocusTint
+                    : (r.ClassListContains(RowActiveClass) ? ActiveTint : Color.clear);
+            }
+        }
+
+        static void MoveSelection(VisualElement container, int dir)
+        {
+            var rows = Rows(container);
+            if (rows.Count == 0) return;
+            var idx = rows.FindIndex(r => ((Task)r.userData).Line == _selectedLine);
+            idx = idx < 0 ? 0 : Mathf.Clamp(idx + dir, 0, rows.Count - 1);
+            _selectedLine = ((Task)rows[idx].userData).Line;
+            Rehighlight(container);
+            rows[idx].parent?.GetFirstAncestorOfType<ScrollView>()?.ScrollTo(rows[idx]);
+        }
+
+        static void OnRowKey(KeyDownEvent e, VisualElement container, Callbacks cb, int totalLines)
+        {
+            // Ignore keystrokes while an inline TextField is being edited — only drive from the container.
+            if (container.focusController?.focusedElement is TextField) return;
+
+            var task = CurrentTask(container);
+            if (task == null) return;
+            var row = CurrentRow(container);
+
+            switch (e.keyCode)
+            {
+                // Arrows are handled by OnRowNav (the navigation system); J/K mirror them here.
+                case KeyCode.J: MoveSelection(container, +1); e.StopPropagation(); return;
+                case KeyCode.K: MoveSelection(container, -1); e.StopPropagation(); return;
+
+                case KeyCode.Space:
+                    if (!task.IsComposite && cb.OnToggled != null) cb.OnToggled(task.Line, !task.Done);
+                    e.StopPropagation(); return;
+
+                case KeyCode.Return:
+                case KeyCode.KeypadEnter:
+                    if (e.actionKey)   // Ctrl/Cmd+Enter → new section at end of document
+                    {
+                        if (cb.OnInsertAfter != null) ShowSectionInsert(container, cb.OnInsertAfter, totalLines);
+                    }
+                    else if (cb.OnReplaceLine != null) BeginRename(row, task, cb);   // rename
+                    e.StopPropagation(); return;
+
+                case KeyCode.F2:
+                    if (cb.OnReplaceLine != null) BeginRename(row, task, cb);
+                    e.StopPropagation(); return;
+
+                case KeyCode.O:
+                    if (cb.OnInsertAfter != null)
+                    {
+                        if (e.shiftKey) ShowChildInsert(row, task, cb.OnInsertAfter);    // child
+                        else            ShowSiblingInsert(row, task, cb.OnInsertAfter);   // sibling
+                    }
+                    e.StopPropagation(); return;
+
+                case KeyCode.Tab:
+                    if (cb.OnReplaceLine != null)
+                        cb.OnReplaceLine(task.Line, e.shiftKey ? Outdent(task.RawLine) : "\t" + task.RawLine);
+                    e.StopPropagation(); return;
+
+                case KeyCode.Delete:
+                case KeyCode.Backspace:
+                    if (cb.OnDeleteRange != null)
+                    {
+                        // Select the line that will slide into this slot, so the cursor stays put.
+                        _selectedLine = task.Line;
+                        cb.OnDeleteRange(task.Line, task.LastLine);
+                    }
+                    e.StopPropagation(); return;
+
+                case KeyCode.D:
+                    if (cb.OnEditDescription != null)
+                        BeginDescriptionEdit(row, task, task.Description ?? "", cb.OnEditDescription);
+                    e.StopPropagation(); return;
+
+                case KeyCode.Alpha0: case KeyCode.Keypad0: SetPri(cb, task, 0); e.StopPropagation(); return;
+                case KeyCode.Alpha1: case KeyCode.Keypad1: SetPri(cb, task, 1); e.StopPropagation(); return;
+                case KeyCode.Alpha2: case KeyCode.Keypad2: SetPri(cb, task, 2); e.StopPropagation(); return;
+                case KeyCode.Alpha3: case KeyCode.Keypad3: SetPri(cb, task, 3); e.StopPropagation(); return;
+                case KeyCode.Alpha4: case KeyCode.Keypad4: SetPri(cb, task, 4); e.StopPropagation(); return;
+                case KeyCode.Alpha5: case KeyCode.Keypad5: SetPri(cb, task, 5); e.StopPropagation(); return;
+            }
+        }
+
+        static void BeginRename(VisualElement row, Task task, Callbacks cb)
+        {
+            var lbl = row?.Q<Label>(TaskLabelName);
+            if (lbl != null)
+                BeginInlineEdit(lbl, lbl.parent, task.Text, v => CommitRename(task, v, cb.OnReplaceLine));
+        }
+
+        /// <summary>Up/Down move the selection; every direction is PreventDefault'd so the focus ring
+        /// can't drag focus off the container (which is the only thing keeping the keyboard alive).</summary>
+        static void OnRowNav(NavigationMoveEvent e, VisualElement container)
+        {
+            if (container.focusController?.focusedElement is TextField) return;
+            switch (e.direction)
+            {
+                case NavigationMoveEvent.Direction.Down: MoveSelection(container, +1); break;
+                case NavigationMoveEvent.Direction.Up:   MoveSelection(container, -1); break;
+            }
+            e.PreventDefault();
+            e.StopPropagation();
+        }
+
+        static void SetPri(Callbacks cb, Task task, int priority)
+        {
+            if (cb.OnSetPriority == null || task.IsComposite) return;
+            cb.OnSetPriority(task.Line, priority);
+        }
+
+        /// <summary>Removes one leading tab (no-op at depth 0).</summary>
+        static string Outdent(string rawLine) =>
+            rawLine.StartsWith("\t") ? rawLine.Substring(1) : rawLine;
+
+        /// <summary>Inline field to add a sibling task after <paramref name="task"/> at the same indent.</summary>
+        static void ShowSiblingInsert(VisualElement wrapper, Task task, Action<int, string[]> onInsertAfter)
+        {
+            var prefix = new string('\t', LeadingTabs(task.RawLine)) + "- [ ] ";
+            var insertRow = new VisualElement { style = { flexDirection = FlexDirection.Row, marginTop = 2, marginBottom = 2 } };
+            var field = new TextField { style = { flexGrow = 1 } };
+            insertRow.Add(field);
+
+            // Place it right after the focused row in the same parent (true sibling position).
+            var parent = wrapper.parent;
+            parent.Insert(parent.IndexOf(wrapper) + 1, insertRow);
+
+            var committed = false;
+            void Commit(string val)
+            {
+                if (committed) return;
+                committed = true;
+                val = val?.Trim();
+                if (!string.IsNullOrEmpty(val))
+                { _selectedLine = task.LastLine + 1; onInsertAfter(task.LastLine, new[] { prefix + val }); }
+                else
+                { parent.Remove(insertRow); ListContainer(wrapper)?.Focus(); }
+            }
+            field.RegisterCallback<KeyDownEvent>(e =>
+            {
+                if (e.keyCode is KeyCode.Return or KeyCode.KeypadEnter) { e.StopPropagation(); Commit(field.value); }
+                else if (e.keyCode == KeyCode.Escape)                    { e.StopPropagation(); Commit(null); }
+            });
+            field.RegisterCallback<FocusOutEvent>(_ => Commit(field.value));
+            field.schedule.Execute(() => field.Focus()).StartingIn(10);
+        }
+
+        /// <summary>Inline field appended to the list to add a new "## " section at the end of the document.</summary>
+        static void ShowSectionInsert(VisualElement container, Action<int, string[]> onInsertAfter, int totalLines)
+        {
+            var footer = new VisualElement { style = { marginTop = 6, marginBottom = 4, marginLeft = 4 } };
+            var field = new TextField { style = { flexGrow = 1 } };
+            footer.Add(field);
+            container.Add(footer);
+
+            var committed = false;
+            void Commit(string val)
+            {
+                if (committed) return;
+                committed = true;
+                val = val?.Trim();
+                if (!string.IsNullOrEmpty(val))
+                { _selectedLine = totalLines + 2; onInsertAfter(totalLines, new[] { "", "## " + val }); }
+                else { container.Remove(footer); container.Focus(); }
+            }
+            field.RegisterCallback<KeyDownEvent>(e =>
+            {
+                if (e.keyCode is KeyCode.Return or KeyCode.KeypadEnter) { e.StopPropagation(); Commit(field.value); }
+                else if (e.keyCode == KeyCode.Escape)                    { e.StopPropagation(); Commit(null); }
+            });
+            field.RegisterCallback<FocusOutEvent>(_ => Commit(field.value));
+            field.schedule.Execute(() => field.Focus()).StartingIn(10);
+        }
+
+        static VisualElement KeyHint()
+        {
+            var hint = PlainLabel("↑↓/JK move · space done · enter rename · O add · ⇧O child · ⇥ indent · 0–5 prio · del remove");
+            hint.selection.isSelectable = false;
+            hint.style.color = MutedColor;
+            hint.style.fontSize = 10;
+            hint.style.marginTop = 8;
+            hint.style.marginLeft = 4;
+            hint.style.whiteSpace = WhiteSpace.Normal;
+            return hint;
         }
 
         // ── Parse ────────────────────────────────────────────────────────────────────
@@ -342,11 +611,35 @@ namespace KodachiGames.Markdown.Editor
         const int MaxPriority  = 5;
         const int IndentPerLevel = 16;
         const string DescLabelName = "__desc_label";
+        const string TaskLabelName = "__task_label";
+
+        /// <summary>USS class on each task-row wrapper — lets the controller find/route rows by source line.</summary>
+        public const string RowClass = "km-task-row";
+        /// <summary>USS class marking the active-task row (so re-highlighting knows its base tint without cb).</summary>
+        const string RowActiveClass = "km-task-row--active";
+        /// <summary>USS class on the list container (the stable, always-focused element).</summary>
+        const string ListClass = "km-task-list";
+
+        // Selection tint (stronger than the active-task tint so the keyboard cursor stands out) and the
+        // active-task tint used when a row is active but not selected.
+        static readonly Color FocusTint  = new(AccentColor.r, AccentColor.g, AccentColor.b, 0.30f);
+        static readonly Color ActiveTint = new(AccentColor.r, AccentColor.g, AccentColor.b, 0.18f);
+
+        // The current keyboard selection, as a source-line index. Survives tree rebuilds: it's plain
+        // data painted onto whichever row owns that line, not UI Toolkit focus (which dies on rebuild).
+        static int _selectedLine = -1;
+
+        // The list's KeyDownEvent / NavigationMoveEvent handlers — tracked so each rebuild
+        // replaces (not stacks) them.
+        static EventCallback<KeyDownEvent> _kbdHandler;
+        static EventCallback<NavigationMoveEvent> _navHandler;
 
         static VisualElement TaskRow(Task task, int depth, Callbacks cb)
         {
             var effectiveDone = task.IsEffectivelyDone;
             var isActive = cb.FileRel != null && ActiveTask.IsActive(cb.FileRel, task.Text);
+
+            var selected = task.Line == _selectedLine;
 
             var wrapper = new VisualElement
             {
@@ -356,11 +649,15 @@ namespace KodachiGames.Markdown.Editor
                     marginBottom = depth == 0 ? 4 : 2,
                     paddingLeft = 4, paddingTop = 1, paddingBottom = 1,
                     borderTopLeftRadius = 3, borderBottomLeftRadius = 3,
-                    backgroundColor = isActive
-                        ? new Color(AccentColor.r, AccentColor.g, AccentColor.b, 0.18f)
-                        : Color.clear
+                    backgroundColor = selected ? FocusTint : (isActive ? ActiveTint : Color.clear)
                 }
             };
+
+            // The row isn't focusable — keyboard focus stays on the container. The row just carries its
+            // Task and is tagged so the controller can find it by source line and repaint the selection.
+            wrapper.userData = task;
+            wrapper.AddToClassList(RowClass);
+            if (isActive) wrapper.AddToClassList(RowActiveClass);
 
             var row = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.FlexStart } };
 
@@ -432,6 +729,10 @@ namespace KodachiGames.Markdown.Editor
             var toggle = new Toggle { value = effectiveDone, style = { marginRight = 4, marginTop = 1 } };
             // Composite tasks are auto-completed by children — toggle is read-only.
             toggle.SetEnabled(!task.IsComposite && cb.OnToggled != null);
+            // Keep the row wrapper the only focusable unit: if the Toggle joined the focus ring,
+            // arrow navigation (and post-rebuild refocus) could park on it instead of the row,
+            // and the keyboard controller would stop responding. Mouse toggling still works.
+            toggle.focusable = false;
             if (!task.IsComposite && cb.OnToggled != null)
                 toggle.RegisterValueChangedCallback(evt => cb.OnToggled(task.Line, evt.newValue));
             row.Add(toggle);
@@ -441,6 +742,7 @@ namespace KodachiGames.Markdown.Editor
 
             // ── Label ─────────────────────────────────────────────────────
             var taskLabel = PlainLabel(task.Text);
+            taskLabel.name = TaskLabelName;
             taskLabel.style.flexGrow = 1;
             if (effectiveDone)
             {
@@ -480,6 +782,7 @@ namespace KodachiGames.Markdown.Editor
             if (cb.OnInsertAfter != null)
             {
                 var addBtn = MutedButton("+", () => ShowChildInsert(wrapper, task, cb.OnInsertAfter));
+                addBtn.focusable = false;   // don't let it join the focus ring — see the Toggle note above
                 addBtn.tooltip = "Add child task";
                 addBtn.style.display = DisplayStyle.None;
                 addBtn.style.flexShrink = 0;
@@ -610,9 +913,9 @@ namespace KodachiGames.Markdown.Editor
                 committed = true;
                 val = val?.Trim();
                 if (!string.IsNullOrEmpty(val))
-                    onInsertAfter(task.LastLine, new[] { childPrefix + val });
+                { _selectedLine = task.LastLine + 1; onInsertAfter(task.LastLine, new[] { childPrefix + val }); }
                 else
-                    wrapper.Remove(insertRow);
+                { wrapper.Remove(insertRow); ListContainer(wrapper)?.Focus(); }
             }
             field.RegisterCallback<KeyDownEvent>(e =>
             {
@@ -698,12 +1001,23 @@ namespace KodachiGames.Markdown.Editor
             parent.RemoveAt(idx);
             parent.Insert(idx, field);
 
+            var listContainer = ListContainer(parent);
             var committed = false;
             void Commit(string val)
             {
                 if (committed) return;
                 committed = true;
                 onCommit(val);
+                // A changed value rebuilds the whole tree (this field is detached, panel == null) and
+                // Populate repaints/refocuses. But a no-op/cancel commits nothing and leaves the field
+                // orphaned in place — put the label back and hand focus to the list container so the
+                // keyboard keeps working.
+                if (field.panel != null)
+                {
+                    var i = parent.IndexOf(field);
+                    if (i >= 0) { parent.RemoveAt(i); parent.Insert(i, label); }
+                    listContainer?.Focus();
+                }
             }
             field.RegisterCallback<KeyDownEvent>(e =>
             {
@@ -714,6 +1028,15 @@ namespace KodachiGames.Markdown.Editor
             });
             field.RegisterCallback<FocusOutEvent>(_ => Commit(field.value));
             parent.schedule.Execute(() => { field.Focus(); field.SelectAll(); }).StartingIn(10);
+        }
+
+        /// <summary>Nearest ancestor task-row (the focusable wrapper), or null (e.g. a section header).</summary>
+        /// <summary>Nearest ancestor list container (the stable focusable element), or null.</summary>
+        static VisualElement ListContainer(VisualElement el)
+        {
+            for (var e = el; e != null; e = e.parent)
+                if (e.ClassListContains(ListClass)) return e;
+            return null;
         }
 
         // ── Visual helpers ────────────────────────────────────────────────────────────

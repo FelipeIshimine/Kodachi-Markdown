@@ -13,12 +13,15 @@ namespace KodachiGames.Markdown.Editor
     /// <summary>
     /// A slide-in quick-view for pinned Markdown files. Press the shortcut
     /// (Edit ▸ Shortcuts ▸ "Window/Markdown Pin Popup", default Ctrl/Cmd+Shift+W) and a
-    /// borderless panel folds open from the left edge, showing the pinned file rendered
-    /// like the Markdown Browser's preview — no file tree. When several files are pinned,
-    /// tabs along the top switch between them; the last viewed file is remembered.
-    /// A header dropdown switches between formatted preview, raw editing, and a prioritised
-    /// Task view (<see cref="TaskView"/>); Ctrl/Cmd+E toggles Formatted/Edit. In Task view,
-    /// right-click a task to set its priority. Press the shortcut again, or Esc, to dismiss.
+    /// borderless panel docks against a screen edge (right by default; the ⇄ header button
+    /// flips it left/right and the choice persists). It opens in the prioritised Task view
+    /// by default, on the last-viewed file — both remembered across sessions.
+    /// When several files are pinned, tabs along the top switch between them.
+    /// A header dropdown switches between formatted preview, raw editing, and the Task view
+    /// (<see cref="TaskView"/>); Ctrl/Cmd+E toggles Formatted/Edit. The Task view is fully
+    /// keyboard-drivable (arrows/J/K move, Space toggles, Enter renames, O adds, Tab indents,
+    /// 0–5 set priority, Del removes — see the hint row). Press the shortcut again, or Esc,
+    /// to dismiss.
     /// </summary>
     public sealed class MarkdownPinPopup : EditorWindow
     {
@@ -43,7 +46,7 @@ namespace KodachiGames.Markdown.Editor
             w.Focus();
         }
 
-        /// <summary>Last window rect, or a right-edge dock against the main window if none saved.</summary>
+        /// <summary>Last window rect, or an edge dock against the main window (per <see cref="Side"/>) if none saved.</summary>
         static Rect LoadRect()
         {
             if (EditorPrefs.HasKey(RectKey + ".w"))
@@ -58,8 +61,15 @@ namespace KodachiGames.Markdown.Editor
                     return r;
             }
 
+            return DockRect(Side);
+        }
+
+        /// <summary>An edge-docked rect against the main editor window for the given side.</summary>
+        static Rect DockRect(DockSide side)
+        {
             var main = EditorGUIUtility.GetMainWindowPosition();
-            return new Rect(main.xMax - ExpandedWidth, main.y, ExpandedWidth, main.height);
+            var x = side == DockSide.Left ? main.x : main.xMax - ExpandedWidth;
+            return new Rect(x, main.y, ExpandedWidth, main.height);
         }
 
         void SaveRect()
@@ -74,8 +84,16 @@ namespace KodachiGames.Markdown.Editor
         // ── Layout / persistence ────────────────────────────────────────────────
 
         const float ExpandedWidth  = 640f;
-        const string LastFileKey   = "KodachiMarkdown.PinPopup.LastFile"; // SessionState
+        const string LastFileKey   = "KodachiMarkdown.PinPopup.LastFile"; // EditorPrefs (persists)
         const string RectKey       = "KodachiMarkdown.PinPopup.Rect";     // EditorPrefs (persists)
+        const string SideKey       = "KodachiMarkdown.PinPopup.Side";     // EditorPrefs (persists)
+
+        enum DockSide { Right, Left }
+        static DockSide Side
+        {
+            get => (DockSide)EditorPrefs.GetInt(SideKey, (int)DockSide.Right);
+            set => EditorPrefs.SetInt(SideKey, (int)value);
+        }
 
         // ── Colors (matched to QuickAccessPopup) ─────────────────────────────────
 
@@ -99,8 +117,8 @@ namespace KodachiGames.Markdown.Editor
 
         enum ViewMode { Formatted, Edit, Tasks }
         static readonly string[] ModeLabels = { "Formatted", "Edit", "Tasks" };
-        const string ModeKey = "KodachiMarkdown.PinPopup.ViewMode"; // SessionState
-        ViewMode _mode = ViewMode.Formatted;
+        const string ModeKey = "KodachiMarkdown.PinPopup.ViewMode"; // EditorPrefs (persists)
+        ViewMode _mode = ViewMode.Tasks;
 
         readonly List<TabRef> _tabs = new();
         // Scroll offset per pinned file, so switching tabs returns to where you left off.
@@ -164,8 +182,7 @@ namespace KodachiGames.Markdown.Editor
             root.Clear();
             root.style.flexGrow = 1;
             root.style.backgroundColor = C_BG;
-            root.style.borderLeftWidth = 1;
-            root.style.borderLeftColor = C_ACCENT;
+            ApplyAccentEdge();
             root.focusable = true;
             root.RegisterCallback<KeyDownEvent>(OnKeyDown, TrickleDown.TrickleDown);
 
@@ -174,18 +191,19 @@ namespace KodachiGames.Markdown.Editor
             var badge = new Label("📌") { style = { fontSize = 13, marginRight = 6 } };
             _title = new Label("PINNED")
             { style = { fontSize = 11, color = C_TEXT, unityFontStyleAndWeight = FontStyle.Bold, flexGrow = 1, letterSpacing = 1f, overflow = Overflow.Hidden, whiteSpace = WhiteSpace.NoWrap } };
-            _mode = (ViewMode)SessionState.GetInt(ModeKey, (int)ViewMode.Formatted);
+            _mode = (ViewMode)EditorPrefs.GetInt(ModeKey, (int)ViewMode.Tasks);
             _modeDropdown = new DropdownField(ModeLabels.ToList(), (int)_mode)
             { style = { marginRight = 6, flexShrink = 0, minWidth = 90 } };
             _modeDropdown.RegisterValueChangedCallback(evt =>
             {
                 _mode = (ViewMode)Array.IndexOf(ModeLabels, evt.newValue);
-                SessionState.SetInt(ModeKey, (int)_mode);
+                EditorPrefs.SetInt(ModeKey, (int)_mode);
                 SaveScroll();
                 Render();
             });
+            var swap = IconButton("⇄", ToggleSide, "Swap to the other screen edge");
             var close = IconButton("✕", Close);
-            hdr.Add(badge); hdr.Add(_title); hdr.Add(_modeDropdown); hdr.Add(close);
+            hdr.Add(badge); hdr.Add(_title); hdr.Add(_modeDropdown); hdr.Add(swap); hdr.Add(close);
             root.Add(hdr);
 
             // Tab bar (one tab per pinned file).
@@ -207,7 +225,8 @@ namespace KodachiGames.Markdown.Editor
             _scroll.Add(_content);
             root.Add(_scroll);
 
-            root.schedule.Execute(() => root.Focus()).StartingIn(50);
+            // Focus the first task row (Tasks mode) so arrows work immediately; else the root.
+            root.schedule.Execute(FocusInitial).StartingIn(50);
         }
 
         void BuildTabs()
@@ -260,7 +279,7 @@ namespace KodachiGames.Markdown.Editor
             var pins = MarkdownPins.RelPaths;
             if (pins.Count == 0) { SelectFile(null); return; }
 
-            var last = SessionState.GetString(LastFileKey, null);
+            var last = EditorPrefs.GetString(LastFileKey, null);
             SelectFile(pins.Contains(last) ? last : pins[0]);
         }
 
@@ -282,7 +301,7 @@ namespace KodachiGames.Markdown.Editor
                 return;
             }
 
-            SessionState.SetString(LastFileKey, rel);
+            EditorPrefs.SetString(LastFileKey, rel);
             _title.text = Path.GetFileName(rel).ToUpperInvariant();
             _emptyView.style.display = DisplayStyle.None;
             _scroll.style.display = DisplayStyle.Flex;
@@ -543,11 +562,45 @@ namespace KodachiGames.Markdown.Editor
             else if ((e.keyCode == KeyCode.Tab || e.keyCode == KeyCode.RightArrow || e.keyCode == KeyCode.LeftArrow)
                      && _tabs.Count > 1
                      // Don't steal arrow keys from the editable raw-text field.
-                     && _mode != ViewMode.Edit)
+                     && _mode != ViewMode.Edit
+                     // Yield to the task-list keyboard controller when the list holds focus, so Tab
+                     // means "indent" and arrows drive selection instead of switching tabs.
+                     && rootVisualElement.focusController?.focusedElement != _content)
             {
                 e.StopPropagation();
                 CycleTab(e.keyCode == KeyCode.LeftArrow ? -1 : 1);
             }
+        }
+
+        /// <summary>Flip the docked edge, mirror the window to the opposite side, and re-apply the accent border.</summary>
+        void ToggleSide()
+        {
+            Side = Side == DockSide.Right ? DockSide.Left : DockSide.Right;
+            position = DockRect(Side);
+            ApplyAccentEdge();
+            // The rect is now authoritative for this side; drop the stale saved rect so a
+            // reopen docks correctly. SaveRect() on close will store the new position.
+            EditorPrefs.DeleteKey(RectKey + ".w");
+        }
+
+        /// <summary>Accent border on the inner-facing edge: left when docked right, right when docked left.</summary>
+        void ApplyAccentEdge()
+        {
+            var root = rootVisualElement;
+            var onLeft = Side == DockSide.Right;
+            root.style.borderLeftWidth  = onLeft ? 1 : 0;
+            root.style.borderRightWidth = onLeft ? 0 : 1;
+            root.style.borderLeftColor  = C_ACCENT;
+            root.style.borderRightColor = C_ACCENT;
+        }
+
+        /// <summary>Focus the task list in Tasks mode (so arrows work at once); otherwise the root.</summary>
+        void FocusInitial()
+        {
+            // In Tasks mode the list container is the stable keyboard-focus target (TaskView keeps
+            // selection as data and focus on the container); elsewhere just focus the root.
+            if (_mode == ViewMode.Tasks && _content != null) _content.Focus();
+            else rootVisualElement.Focus();
         }
 
         void CycleTab(int dir)
