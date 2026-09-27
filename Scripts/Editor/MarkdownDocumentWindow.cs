@@ -57,7 +57,7 @@ namespace KodachiGames.Markdown.Editor
         {
             if (_content == null)
                 return;
-            MarkdownView.Populate(_content, File.ReadAllText(path));
+            MarkdownView.Populate(_content, File.ReadAllText(path), documentPath: path);
             _scroll.scrollOffset = Vector2.zero;
         }
 

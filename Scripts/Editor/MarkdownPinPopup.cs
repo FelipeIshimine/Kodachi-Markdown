@@ -363,7 +363,7 @@ namespace KodachiGames.Markdown.Editor
             else if (_mode == ViewMode.Formatted)
             {
                 // Truncated/unreadable content renders read-only checkboxes (null callback).
-                MarkdownView.Populate(_content, _rawText, _truncated ? null : ToggleCheckbox);
+                MarkdownView.Populate(_content, _rawText, _truncated ? null : ToggleCheckbox, MarkdownPins.ToFull(_activeRel));
             }
             else
             {

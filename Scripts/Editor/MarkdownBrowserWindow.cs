@@ -291,7 +291,7 @@ namespace KodachiGames.Markdown.Editor
             if (_formatToggle.value)
             {
                 MarkdownView.Populate(_previewContent, _rawText,
-                    _truncated ? null : ToggleCheckbox);
+                    _truncated ? null : ToggleCheckbox, _selected.FullPath);
             }
             else
             {
