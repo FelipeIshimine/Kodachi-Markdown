@@ -20,6 +20,23 @@ namespace KodachiGames.Markdown.Editor
         [MenuItem("Kodachi/Markdown Browser")]
         public static void Open() => GetWindow<MarkdownBrowserWindow>("Markdown");
 
+        public static void OpenFile(string fullPath)
+        {
+            if (!File.Exists(fullPath))
+                throw new FileNotFoundException($"No Markdown file at {fullPath}.", fullPath);
+            var window = GetWindow<MarkdownBrowserWindow>("Markdown");
+            string normalized = fullPath.Replace('\\', '/');
+            string relative = normalized.StartsWith(ProjectRoot + "/", System.StringComparison.OrdinalIgnoreCase)
+                ? normalized.Substring(ProjectRoot.Length + 1)
+                : normalized;
+            var entry = new MarkdownFileTree.FileEntry { Name = Path.GetFileName(normalized), RelPath = relative, FullPath = normalized };
+            if (window._previewContent == null)
+                window._pendingFile = entry;
+            else
+                window.ShowPreview(entry);
+            window.Focus();
+        }
+
         TreeView _tree;
         TwoPaneSplitView _split;
         VisualElement _leftPane;
@@ -36,6 +53,7 @@ namespace KodachiGames.Markdown.Editor
         Button _revealButton;
 
         FileEntrySelection _selected;
+        MarkdownFileTree.FileEntry _pendingFile;
         string _rawText;
         bool _truncated;
 
@@ -77,6 +95,7 @@ namespace KodachiGames.Markdown.Editor
 
             _status = new Label { style = { unityTextAlign = TextAnchor.MiddleLeft, minWidth = 90 } };
             toolbar.Add(_status);
+            toolbar.Add(WindowGuide.Button(typeof(MarkdownBrowserWindow), "markdown-browser"));
 
             root.Add(toolbar);
 
@@ -101,6 +120,11 @@ namespace KodachiGames.Markdown.Editor
             _split.Add(BuildPreviewPane());
 
             Refresh();
+            if (_pendingFile != null)
+            {
+                ShowPreview(_pendingFile);
+                _pendingFile = null;
+            }
 
             // Restore tree visibility after layout (CollapseChild needs the split to be in the hierarchy).
             _treeVisible = SessionState.GetBool(TreeVisibleKey, true);
