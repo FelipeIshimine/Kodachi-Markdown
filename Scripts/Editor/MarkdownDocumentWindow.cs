@@ -14,8 +14,9 @@ namespace KodachiGames.Markdown.Editor
 
         private ScrollView _scroll;
         private VisualElement _content;
+        [NonSerialized] private string _pendingAnchor;
 
-        public static void Open(string fullPath)
+        public static void Open(string fullPath, string anchor = null)
         {
             if (!File.Exists(fullPath))
                 throw new FileNotFoundException($"No Markdown file at {fullPath}.", fullPath);
@@ -32,6 +33,7 @@ namespace KodachiGames.Markdown.Editor
             }
 
             window.titleContent = new GUIContent(TitleOf(normalized), EditorGUIUtility.IconContent("TextAsset Icon").image);
+            window._pendingAnchor = anchor;
             window.Render();
             window.Focus();
         }
@@ -59,6 +61,10 @@ namespace KodachiGames.Markdown.Editor
                 return;
             MarkdownView.Populate(_content, File.ReadAllText(path), documentPath: path);
             _scroll.scrollOffset = Vector2.zero;
+            if (_pendingAnchor == null)
+                return;
+            MarkdownView.ScrollToAnchorAfterLayout(_content, _pendingAnchor);
+            _pendingAnchor = null;
         }
 
         private static string TitleOf(string fullPath)

@@ -20,14 +20,22 @@ namespace KodachiGames.Markdown.Editor
     public static class MarkdownView
     {
         static readonly Regex Heading = new(@"^(#{1,6})\s+(.*)$", RegexOptions.Compiled);
-        static readonly Regex Checkbox = new(@"^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$", RegexOptions.Compiled);
-        static readonly Regex Bullet = new(@"^(\s*)[-*+]\s+(.*)$", RegexOptions.Compiled);
-        static readonly Regex Numbered = new(@"^(\s*)(\d+)\.\s+(.*)$", RegexOptions.Compiled);
-        static readonly Regex Quote = new(@"^>\s?(.*)$", RegexOptions.Compiled);
-        static readonly Regex LinkAt = new(@"\G\[([^\]]*)\]\(\s*<?([^)\s>]*)>?(?:\s+""[^""]*"")?\s*\)", RegexOptions.Compiled);
-        static readonly Regex AutolinkAt = new(@"\G<((?:https?|mailto):[^>\s]+)>", RegexOptions.Compiled);
-        static readonly Regex Words = new(@"\S+\s*|\s+", RegexOptions.Compiled);
+        static readonly Regex ListMarker = new(@"^( *)([-*+]|\d{1,9}[.)])( +)(.*)$", RegexOptions.Compiled);
+        static readonly Regex TaskMarker = new(@"^\[([ xX])\]\s+(.*)$", RegexOptions.Compiled);
+        static readonly Regex Quote = new(@"^ {0,3}>\s?(.*)$", RegexOptions.Compiled);
+        static readonly Regex AlertMarker = new(@"^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        static readonly Regex ReferenceDefinition = new(@"^ {0,3}\[([^\]^][^\]]*)\]:\s*<?([^\s>]+)>?(?:\s+(?:""[^""]*""|'[^']*'|\([^)]*\)))?\s*$", RegexOptions.Compiled);
         static readonly Regex TableSeparator = new(@"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$", RegexOptions.Compiled);
+
+        static readonly Regex LinkAt = new(@"\G\[([^\]]*)\]\(\s*<?([^)\s>]*)>?(?:\s+""[^""]*"")?\s*\)", RegexOptions.Compiled);
+        static readonly Regex ReferenceLinkAt = new(@"\G\[([^\]]+)\]\[([^\]]*)\]", RegexOptions.Compiled);
+        static readonly Regex ShortcutLinkAt = new(@"\G\[([^\]]+)\]", RegexOptions.Compiled);
+        static readonly Regex AutolinkAt = new(@"\G<((?:https?|mailto):[^>\s]+)>", RegexOptions.Compiled);
+        static readonly Regex SpanAt = new(@"\G<span\s+style\s*=\s*[""']\s*color\s*:\s*([^;""']+?)\s*;?\s*[""']\s*>(.*?)</span>", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        static readonly Regex FontAt = new(@"\G<font\s+color\s*=\s*[""']?([^""'\s>]+)[""']?\s*>(.*?)</font>", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        static readonly Regex BreakAt = new(@"\G<br\s*/?>", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        static readonly Regex Words = new(@"\S+\s*|\s+", RegexOptions.Compiled);
+        static readonly Regex SlugStrip = new(@"[^\p{L}\p{N}\- _]", RegexOptions.Compiled);
 
         static readonly Color CodeColor = new(0.79f, 0.64f, 0.43f);
         static readonly Color CodeBackground = new(0f, 0f, 0f, 0.25f);
@@ -37,11 +45,9 @@ namespace KodachiGames.Markdown.Editor
         static readonly Color TableHeaderColor = new(1f, 1f, 1f, 0.08f);
         static readonly Color TableStripeColor = new(1f, 1f, 1f, 0.03f);
 
-        static readonly Regex AlertMarker = new(@"^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-        static readonly Regex SpanAt = new(@"\G<span\s+style\s*=\s*[""']\s*color\s*:\s*([^;""']+?)\s*;?\s*[""']\s*>(.*?)</span>", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-        static readonly Regex FontAt = new(@"\G<font\s+color\s*=\s*[""']?([^""'\s>]+)[""']?\s*>(.*?)</font>", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
         const int BodyFontSize = 12;
+        const char LineBreak = '\u2028';
+        static readonly string[] BulletGlyphs = { "•", "◦", "▪" };
 
         enum AlertKind
         {
@@ -78,6 +84,34 @@ namespace KodachiGames.Markdown.Editor
             }
         }
 
+        readonly struct SourceLine
+        {
+            public readonly string Text;
+            public readonly int Index;
+
+            public SourceLine(string text, int index)
+            {
+                Text = text;
+                Index = index;
+            }
+        }
+
+        sealed class RenderContext
+        {
+            public readonly VisualElement Root;
+            public readonly string DocumentPath;
+            public readonly Action<int, bool> OnCheckboxToggled;
+            public readonly Dictionary<string, string> References = new(StringComparer.OrdinalIgnoreCase);
+            public readonly Dictionary<string, VisualElement> Anchors = new();
+
+            public RenderContext(VisualElement root, string documentPath, Action<int, bool> onCheckboxToggled)
+            {
+                Root = root;
+                DocumentPath = documentPath;
+                OnCheckboxToggled = onCheckboxToggled;
+            }
+        }
+
         /// <param name="onCheckboxToggled">
         /// Invoked when a task-list checkbox (<c>- [ ]</c> / <c>- [x]</c>) is clicked, with the
         /// zero-based source line index and the new checked state. Pass <c>null</c> to render
@@ -86,9 +120,104 @@ namespace KodachiGames.Markdown.Editor
         public static void Populate(VisualElement container, string markdown, Action<int, bool> onCheckboxToggled = null, string documentPath = null)
         {
             container.Clear();
+            var ctx = new RenderContext(container, documentPath, onCheckboxToggled);
+            container.userData = ctx.Anchors;
             if (string.IsNullOrEmpty(markdown)) return;
 
-            var lines = markdown.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            var lines = markdown.Replace("\r\n", "\n").Replace('\r', '\n').Replace("\t", "    ").Split('\n');
+            RenderBlocks(container, Preprocess(lines, ctx), ctx, 0);
+        }
+
+        public static void ScrollToAnchorAfterLayout(VisualElement container, string anchor)
+        {
+            var target = FindAnchor((Dictionary<string, VisualElement>)container.userData, anchor);
+            EventCallback<GeometryChangedEvent> handler = null;
+            handler = _ =>
+            {
+                target.UnregisterCallback(handler);
+                ScrollTo(target);
+            };
+            target.RegisterCallback(handler);
+        }
+
+        static VisualElement FindAnchor(Dictionary<string, VisualElement> anchors, string anchor)
+        {
+            if (!anchors.TryGetValue(Uri.UnescapeDataString(anchor).ToLowerInvariant(), out var target))
+                throw new KeyNotFoundException($"No heading with anchor '#{anchor}' in this Markdown document.");
+            return target;
+        }
+
+        static void ScrollTo(VisualElement target)
+        {
+            var scroll = target.GetFirstAncestorOfType<ScrollView>()
+                ?? throw new InvalidOperationException("Markdown content is not inside a ScrollView, so it cannot scroll to an anchor.");
+            var delta = target.worldBound.y - scroll.contentViewport.worldBound.y;
+            scroll.scrollOffset = new Vector2(scroll.scrollOffset.x, scroll.scrollOffset.y + delta);
+        }
+
+        static List<SourceLine> Preprocess(string[] lines, RenderContext ctx)
+        {
+            var result = new List<SourceLine>();
+            var inFence = false;
+            var inComment = false;
+            var cleaned = new StringBuilder();
+
+            for (var index = 0; index < lines.Length; index++)
+            {
+                var text = lines[index];
+                if (!inComment && IsFence(text))
+                {
+                    inFence = !inFence;
+                    result.Add(new SourceLine(text, index));
+                    continue;
+                }
+                if (inFence)
+                {
+                    result.Add(new SourceLine(text, index));
+                    continue;
+                }
+
+                var touchedComment = inComment || text.Contains("<!--");
+                cleaned.Clear();
+                var pos = 0;
+                while (pos < text.Length)
+                {
+                    if (inComment)
+                    {
+                        var close = text.IndexOf("-->", pos, StringComparison.Ordinal);
+                        if (close < 0) break;
+                        inComment = false;
+                        pos = close + 3;
+                        continue;
+                    }
+                    var open = text.IndexOf("<!--", pos, StringComparison.Ordinal);
+                    if (open < 0)
+                    {
+                        cleaned.Append(text, pos, text.Length - pos);
+                        break;
+                    }
+                    cleaned.Append(text, pos, open - pos);
+                    inComment = true;
+                    pos = open + 4;
+                }
+
+                var line = cleaned.ToString();
+                if (touchedComment && string.IsNullOrWhiteSpace(line)) continue;
+
+                var definition = ReferenceDefinition.Match(line);
+                if (definition.Success)
+                {
+                    ctx.References[definition.Groups[1].Value.Trim()] = definition.Groups[2].Value;
+                    continue;
+                }
+
+                result.Add(new SourceLine(line, index));
+            }
+            return result;
+        }
+
+        static void RenderBlocks(VisualElement container, List<SourceLine> lines, RenderContext ctx, int listDepth)
+        {
             var paragraph = new List<string>();
             var fence = new List<string>();
             var inFence = false;
@@ -96,16 +225,16 @@ namespace KodachiGames.Markdown.Editor
             void FlushParagraph()
             {
                 if (paragraph.Count == 0) return;
-                var block = Inline(string.Join(" ", paragraph), InlineStyle.None, BodyFontSize, documentPath);
-                block.style.marginBottom = 6;
+                var block = Inline(JoinParagraph(paragraph), InlineStyle.None, BodyFontSize, ctx);
+                block.style.marginBottom = listDepth > 0 ? 2 : 6;
                 container.Add(block);
                 paragraph.Clear();
             }
 
-            for (var lineIndex = 0; lineIndex < lines.Length; lineIndex++)
+            for (var i = 0; i < lines.Count; i++)
             {
-                var line = lines[lineIndex];
-                if (line.TrimStart().StartsWith("```"))
+                var line = lines[i].Text;
+                if (IsFence(line))
                 {
                     if (inFence) { container.Add(CodeBlock(fence)); fence.Clear(); inFence = false; }
                     else { FlushParagraph(); inFence = true; }
@@ -116,25 +245,24 @@ namespace KodachiGames.Markdown.Editor
 
                 if (string.IsNullOrWhiteSpace(line)) { FlushParagraph(); continue; }
 
-                if (IsTableStart(lines, lineIndex))
+                if (IsTableStart(lines, i))
                 {
                     FlushParagraph();
                     var header = SplitRow(line);
-                    var alignments = ParseAlignments(SplitRow(lines[lineIndex + 1]));
+                    var alignments = ParseAlignments(SplitRow(lines[i + 1].Text));
                     var rows = new List<string[]>();
-                    lineIndex += 2;
-                    while (lineIndex < lines.Length && !string.IsNullOrWhiteSpace(lines[lineIndex]) && lines[lineIndex].Contains('|'))
+                    i += 2;
+                    while (i < lines.Count && !string.IsNullOrWhiteSpace(lines[i].Text) && lines[i].Text.Contains('|'))
                     {
-                        rows.Add(SplitRow(lines[lineIndex]));
-                        lineIndex++;
+                        rows.Add(SplitRow(lines[i].Text));
+                        i++;
                     }
-                    lineIndex--;
-                    container.Add(Table(header, alignments, rows, documentPath));
+                    i--;
+                    container.Add(Table(header, alignments, rows, ctx));
                     continue;
                 }
 
-                var trimmed = line.Trim();
-                if (trimmed is "---" or "***" or "___")
+                if (IsRule(line))
                 {
                     FlushParagraph();
                     container.Add(Rule());
@@ -145,72 +273,125 @@ namespace KodachiGames.Markdown.Editor
                 if (h.Success)
                 {
                     FlushParagraph();
-                    container.Add(HeadingBlock(h.Groups[1].Value.Length, h.Groups[2].Value, documentPath));
+                    container.Add(HeadingBlock(h.Groups[1].Value.Length, h.Groups[2].Value, ctx));
                     continue;
                 }
 
                 if (Quote.IsMatch(line))
                 {
                     FlushParagraph();
-                    var quoteLines = new List<string>();
-                    while (lineIndex < lines.Length && Quote.IsMatch(lines[lineIndex]))
+                    var quoteLines = new List<SourceLine>();
+                    while (i < lines.Count && Quote.IsMatch(lines[i].Text))
                     {
-                        quoteLines.Add(Quote.Match(lines[lineIndex]).Groups[1].Value);
-                        lineIndex++;
+                        quoteLines.Add(new SourceLine(Quote.Match(lines[i].Text).Groups[1].Value, lines[i].Index));
+                        i++;
                     }
-                    lineIndex--;
-                    var alert = AlertMarker.Match(quoteLines[0]);
+                    i--;
+                    var alert = AlertMarker.Match(quoteLines[0].Text);
                     container.Add(alert.Success
-                        ? AlertBlock(ParseAlertKind(alert.Groups[1].Value), quoteLines.GetRange(1, quoteLines.Count - 1), documentPath)
-                        : QuoteBlock(quoteLines, documentPath));
+                        ? AlertBlock(ParseAlertKind(alert.Groups[1].Value), quoteLines.GetRange(1, quoteLines.Count - 1), ctx, listDepth)
+                        : QuoteBlock(quoteLines, ctx, listDepth));
                     continue;
                 }
 
-                var c = Checkbox.Match(line);
-                if (c.Success)
+                var marker = ListMarker.Match(line);
+                if (marker.Success)
                 {
                     FlushParagraph();
-                    var indent = c.Groups[1].Value.Length;
-                    var isChecked = c.Groups[2].Value is "x" or "X";
-                    var sourceLine = lineIndex;
-                    container.Add(CheckboxItem(indent, isChecked, c.Groups[3].Value, documentPath,
-                        onCheckboxToggled == null ? null : v => onCheckboxToggled(sourceLine, v)));
+                    var indent = marker.Groups[1].Value.Length;
+                    var spacing = marker.Groups[3].Value.Length;
+                    var contentColumn = indent + marker.Groups[2].Value.Length + (spacing > 4 ? 1 : spacing);
+                    var itemLines = new List<SourceLine> { new(marker.Groups[4].Value, lines[i].Index) };
+                    var j = i + 1;
+                    while (j < lines.Count)
+                    {
+                        var next = lines[j].Text;
+                        if (string.IsNullOrWhiteSpace(next))
+                        {
+                            var k = j;
+                            while (k < lines.Count && string.IsNullOrWhiteSpace(lines[k].Text)) k++;
+                            if (k == lines.Count || !BelongsToItem(lines[k].Text, indent, contentColumn)) break;
+                            for (; j < k; j++) itemLines.Add(new SourceLine(string.Empty, lines[j].Index));
+                            continue;
+                        }
+                        if (BelongsToItem(next, indent, contentColumn))
+                        {
+                            itemLines.Add(new SourceLine(next.Substring(Math.Min(contentColumn, LeadingSpaces(next))), lines[j].Index));
+                            j++;
+                            continue;
+                        }
+                        if (!string.IsNullOrWhiteSpace(lines[j - 1].Text) && !IsBlockStart(next))
+                        {
+                            itemLines.Add(new SourceLine(next.TrimStart(), lines[j].Index));
+                            j++;
+                            continue;
+                        }
+                        break;
+                    }
+                    container.Add(ListItem(marker.Groups[2].Value, itemLines, ctx, listDepth));
+                    i = j - 1;
                     continue;
                 }
 
-                var b = Bullet.Match(line);
-                if (b.Success)
-                {
-                    FlushParagraph();
-                    container.Add(ListItem(b.Groups[1].Value.Length, "•", b.Groups[2].Value, documentPath));
-                    continue;
-                }
-
-                var n = Numbered.Match(line);
-                if (n.Success)
-                {
-                    FlushParagraph();
-                    container.Add(ListItem(n.Groups[1].Value.Length, n.Groups[2].Value + ".", n.Groups[3].Value, documentPath));
-                    continue;
-                }
-
-                paragraph.Add(trimmed);
+                paragraph.Add(line);
             }
 
             if (inFence && fence.Count > 0) container.Add(CodeBlock(fence));
             FlushParagraph();
         }
 
-        static VisualElement HeadingBlock(int level, string text, string documentPath)
+        static bool BelongsToItem(string line, int itemIndent, int contentColumn)
+        {
+            var leading = LeadingSpaces(line);
+            return leading >= contentColumn || leading > itemIndent && ListMarker.IsMatch(line);
+        }
+
+        static int LeadingSpaces(string line)
+        {
+            var count = 0;
+            while (count < line.Length && line[count] == ' ') count++;
+            return count;
+        }
+
+        static bool IsFence(string line) => line.TrimStart().StartsWith("```");
+
+        static bool IsRule(string line) => line.Trim() is "---" or "***" or "___";
+
+        static bool IsBlockStart(string line) =>
+            IsFence(line) || IsRule(line) || Heading.IsMatch(line) || Quote.IsMatch(line) || ListMarker.IsMatch(line);
+
+        static string JoinParagraph(List<string> lines)
+        {
+            var builder = new StringBuilder();
+            for (var k = 0; k < lines.Count; k++)
+            {
+                var raw = lines[k];
+                var text = raw.Trim();
+                var last = k == lines.Count - 1;
+                var backslashBreak = !last && text.EndsWith("\\");
+                if (backslashBreak) text = text.Substring(0, text.Length - 1).TrimEnd();
+                builder.Append(text);
+                if (last) break;
+                builder.Append(backslashBreak || raw.EndsWith("  ") ? LineBreak : ' ');
+            }
+            return builder.ToString();
+        }
+
+        static VisualElement HeadingBlock(int level, string text, RenderContext ctx)
         {
             var fontSize = level switch { 1 => 20, 2 => 17, 3 => 15, 4 => 14, _ => 13 };
-            var block = Inline(text, InlineStyle.Bold, fontSize, documentPath);
+            var block = Inline(text, InlineStyle.Bold, fontSize, ctx);
             block.style.marginTop = 8;
             block.style.marginBottom = 4;
+
+            var baseSlug = SlugStrip.Replace(PlainText(text, ctx).Trim().ToLowerInvariant(), string.Empty).Replace(' ', '-');
+            var slug = baseSlug;
+            for (var suffix = 1; ctx.Anchors.ContainsKey(slug); suffix++) slug = $"{baseSlug}-{suffix}";
+            ctx.Anchors[slug] = block;
             return block;
         }
 
-        static VisualElement QuoteBlock(List<string> quoteLines, string documentPath)
+        static VisualElement QuoteBlock(List<SourceLine> quoteLines, RenderContext ctx, int listDepth)
         {
             var block = new VisualElement();
             block.style.color = MutedColor;
@@ -218,11 +399,11 @@ namespace KodachiGames.Markdown.Editor
             block.style.borderLeftWidth = 3;
             block.style.borderLeftColor = MutedColor;
             block.style.marginBottom = 6;
-            AddQuoteParagraphs(block, quoteLines, InlineStyle.Italic, documentPath);
+            RenderBlocks(block, quoteLines, ctx, listDepth);
             return block;
         }
 
-        static VisualElement AlertBlock(AlertKind kind, List<string> bodyLines, string documentPath)
+        static VisualElement AlertBlock(AlertKind kind, List<SourceLine> bodyLines, RenderContext ctx, int listDepth)
         {
             var (title, color) = kind switch
             {
@@ -252,7 +433,7 @@ namespace KodachiGames.Markdown.Editor
             heading.style.marginBottom = 4;
             block.Add(heading);
 
-            AddQuoteParagraphs(block, bodyLines, InlineStyle.None, documentPath);
+            RenderBlocks(block, bodyLines, ctx, listDepth);
             return block;
         }
 
@@ -266,28 +447,7 @@ namespace KodachiGames.Markdown.Editor
             _ => throw new ArgumentOutOfRangeException(nameof(marker), marker, "Unknown alert marker.")
         };
 
-        static void AddQuoteParagraphs(VisualElement block, List<string> quoteLines, InlineStyle style, string documentPath)
-        {
-            var paragraph = new List<string>();
-
-            void Flush()
-            {
-                if (paragraph.Count == 0) return;
-                var body = Inline(string.Join(" ", paragraph), style, BodyFontSize, documentPath);
-                body.style.marginBottom = 2;
-                block.Add(body);
-                paragraph.Clear();
-            }
-
-            foreach (var quoteLine in quoteLines)
-            {
-                if (string.IsNullOrWhiteSpace(quoteLine)) Flush();
-                else paragraph.Add(quoteLine.Trim());
-            }
-            Flush();
-        }
-
-        static VisualElement ListItem(int indent, string marker, string text, string documentPath)
+        static VisualElement ListItem(string marker, List<SourceLine> itemLines, RenderContext ctx, int listDepth)
         {
             var row = new VisualElement
             {
@@ -295,49 +455,38 @@ namespace KodachiGames.Markdown.Editor
                 {
                     flexDirection = FlexDirection.Row,
                     alignItems = Align.FlexStart,
-                    marginLeft = 12 + indent,
+                    marginLeft = listDepth == 0 ? 12 : 2,
                     marginBottom = 2
                 }
             };
 
-            var markerLabel = new Label(marker) { enableRichText = false };
-            markerLabel.style.minWidth = 14;
-            markerLabel.style.marginLeft = 0;
-            markerLabel.style.marginRight = 4;
-            markerLabel.style.paddingLeft = 0;
-            markerLabel.style.paddingRight = 0;
-            row.Add(markerLabel);
-
-            var body = Inline(text, InlineStyle.None, BodyFontSize, documentPath);
-            body.style.flexGrow = 1;
-            body.style.flexShrink = 1;
-            row.Add(body);
-            return row;
-        }
-
-        static VisualElement CheckboxItem(int indent, bool isChecked, string text, string documentPath, Action<bool> onToggled)
-        {
-            var row = new VisualElement
+            var body = new VisualElement { style = { flexGrow = 1, flexShrink = 1, minWidth = 0 } };
+            var task = TaskMarker.Match(itemLines[0].Text);
+            if (task.Success)
             {
-                style =
-                {
-                    flexDirection = FlexDirection.Row,
-                    alignItems = Align.FlexStart,
-                    marginLeft = 12 + indent,
-                    marginBottom = 2
-                }
-            };
+                var isChecked = task.Groups[1].Value is "x" or "X";
+                var sourceLine = itemLines[0].Index;
+                var toggle = new Toggle { value = isChecked, style = { marginRight = 4, marginTop = 1 } };
+                toggle.SetEnabled(ctx.OnCheckboxToggled != null);
+                if (ctx.OnCheckboxToggled != null)
+                    toggle.RegisterValueChangedCallback(evt => ctx.OnCheckboxToggled(sourceLine, evt.newValue));
+                row.Add(toggle);
+                if (isChecked) body.style.color = MutedColor;
+                itemLines[0] = new SourceLine(task.Groups[2].Value, itemLines[0].Index);
+            }
+            else
+            {
+                var glyph = char.IsDigit(marker[0]) ? marker : BulletGlyphs[listDepth % BulletGlyphs.Length];
+                var markerLabel = new Label(glyph) { enableRichText = false };
+                markerLabel.style.minWidth = 14;
+                markerLabel.style.marginLeft = 0;
+                markerLabel.style.marginRight = 4;
+                markerLabel.style.paddingLeft = 0;
+                markerLabel.style.paddingRight = 0;
+                row.Add(markerLabel);
+            }
 
-            var toggle = new Toggle { value = isChecked, style = { marginRight = 4, marginTop = 1 } };
-            toggle.SetEnabled(onToggled != null);
-            if (onToggled != null)
-                toggle.RegisterValueChangedCallback(evt => onToggled(evt.newValue));
-            row.Add(toggle);
-
-            var body = Inline(text, isChecked ? InlineStyle.Italic : InlineStyle.None, BodyFontSize, documentPath);
-            body.style.flexGrow = 1;
-            body.style.flexShrink = 1;
-            if (isChecked) body.style.color = MutedColor;
+            RenderBlocks(body, itemLines, ctx, listDepth + 1);
             row.Add(body);
             return row;
         }
@@ -364,11 +513,11 @@ namespace KodachiGames.Markdown.Editor
             return box;
         }
 
-        static bool IsTableStart(string[] lines, int index)
+        static bool IsTableStart(List<SourceLine> lines, int index)
         {
-            if (index + 1 >= lines.Length || !lines[index].Contains('|')) return false;
-            if (!TableSeparator.IsMatch(lines[index + 1])) return false;
-            return SplitRow(lines[index]).Length == SplitRow(lines[index + 1]).Length;
+            if (index + 1 >= lines.Count || !lines[index].Text.Contains('|')) return false;
+            if (!TableSeparator.IsMatch(lines[index + 1].Text)) return false;
+            return SplitRow(lines[index].Text).Length == SplitRow(lines[index + 1].Text).Length;
         }
 
         static string[] SplitRow(string line)
@@ -417,15 +566,15 @@ namespace KodachiGames.Markdown.Editor
             return alignments;
         }
 
-        static VisualElement Table(string[] header, Justify[] alignments, List<string[]> rows, string documentPath)
+        static VisualElement Table(string[] header, Justify[] alignments, List<string[]> rows, RenderContext ctx)
         {
             var columns = header.Length;
             var weights = new float[columns];
             for (var col = 0; col < columns; col++)
-                weights[col] = PlainText(header[col]).Length;
+                weights[col] = PlainText(header[col], ctx).Length;
             foreach (var row in rows)
                 for (var col = 0; col < columns && col < row.Length; col++)
-                    weights[col] = Mathf.Max(weights[col], PlainText(row[col]).Length);
+                    weights[col] = Mathf.Max(weights[col], PlainText(row[col], ctx).Length);
             for (var col = 0; col < columns; col++)
                 weights[col] = Mathf.Clamp(weights[col], 4f, 60f);
 
@@ -439,13 +588,13 @@ namespace KodachiGames.Markdown.Editor
                 }
             };
 
-            table.Add(TableRow(header, alignments, weights, true, false, documentPath));
+            table.Add(TableRow(header, alignments, weights, true, false, ctx));
             for (var r = 0; r < rows.Count; r++)
-                table.Add(TableRow(rows[r], alignments, weights, false, r % 2 == 1, documentPath));
+                table.Add(TableRow(rows[r], alignments, weights, false, r % 2 == 1, ctx));
             return table;
         }
 
-        static VisualElement TableRow(string[] cells, Justify[] alignments, float[] weights, bool isHeader, bool isStriped, string documentPath)
+        static VisualElement TableRow(string[] cells, Justify[] alignments, float[] weights, bool isHeader, bool isStriped, RenderContext ctx)
         {
             var row = new VisualElement { style = { flexDirection = FlexDirection.Row } };
             if (isHeader) row.style.backgroundColor = TableHeaderColor;
@@ -454,7 +603,7 @@ namespace KodachiGames.Markdown.Editor
             for (var col = 0; col < weights.Length; col++)
             {
                 var cell = Inline(col < cells.Length ? cells[col] : string.Empty,
-                    isHeader ? InlineStyle.Bold : InlineStyle.None, BodyFontSize, documentPath);
+                    isHeader ? InlineStyle.Bold : InlineStyle.None, BodyFontSize, ctx);
                 cell.style.justifyContent = alignments[col];
                 cell.style.flexGrow = weights[col];
                 cell.style.flexShrink = 1;
@@ -485,7 +634,7 @@ namespace KodachiGames.Markdown.Editor
             };
         }
 
-        static VisualElement Inline(string text, InlineStyle baseStyle, int fontSize, string documentPath)
+        static VisualElement Inline(string text, InlineStyle baseStyle, int fontSize, RenderContext ctx)
         {
             var flow = new VisualElement
             {
@@ -499,15 +648,22 @@ namespace KodachiGames.Markdown.Editor
             };
 
             var runs = new List<InlineRun>();
-            ParseInline(text, baseStyle, null, null, runs);
+            ParseInline(text, baseStyle, null, null, ctx, runs);
             var spaceWidth = Mathf.Round(fontSize * 0.3f);
             foreach (var run in runs)
+            {
+                if (run.Text.Length == 1 && run.Text[0] == LineBreak)
+                {
+                    flow.Add(new VisualElement { style = { width = Length.Percent(100), height = 0 } });
+                    continue;
+                }
                 foreach (Match word in Words.Matches(run.Text))
-                    flow.Add(Word(word.Value, run, spaceWidth, documentPath));
+                    flow.Add(Word(word.Value, run, spaceWidth, ctx));
+            }
             return flow;
         }
 
-        static VisualElement Word(string word, InlineRun run, float spaceWidth, string documentPath)
+        static VisualElement Word(string word, InlineRun run, float spaceWidth, RenderContext ctx)
         {
             var visible = word.TrimEnd();
             var label = new Label(visible) { enableRichText = false };
@@ -562,7 +718,7 @@ namespace KodachiGames.Markdown.Editor
                 label.style.borderBottomColor = LinkColor;
                 label.tooltip = run.Link;
                 var target = run.Link;
-                label.RegisterCallback<ClickEvent>(_ => OpenLink(target, documentPath));
+                label.RegisterCallback<ClickEvent>(_ => OpenLink(target, ctx));
             }
 
             if (run.Color is { } color)
@@ -574,7 +730,7 @@ namespace KodachiGames.Markdown.Editor
             return label;
         }
 
-        static void OpenLink(string link, string documentPath)
+        static void OpenLink(string link, RenderContext ctx)
         {
             if (link.Contains("://") || link.StartsWith("mailto:"))
             {
@@ -583,14 +739,21 @@ namespace KodachiGames.Markdown.Editor
             }
 
             var hash = link.IndexOf('#');
+            var anchor = hash >= 0 ? link.Substring(hash + 1) : null;
             var relative = Uri.UnescapeDataString(hash >= 0 ? link.Substring(0, hash) : link);
-            if (relative.Length == 0) return;
-            if (documentPath == null)
+            if (relative.Length == 0)
+            {
+                if (string.IsNullOrEmpty(anchor)) return;
+                ScrollTo(FindAnchor(ctx.Anchors, anchor));
+                return;
+            }
+
+            if (ctx.DocumentPath == null)
                 throw new InvalidOperationException($"Cannot resolve relative link '{link}': the Markdown was rendered without a document path.");
 
-            var fullPath = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(documentPath), relative));
+            var fullPath = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(ctx.DocumentPath), relative));
             if (fullPath.EndsWith(".md", StringComparison.OrdinalIgnoreCase))
-                MarkdownDocumentWindow.Open(fullPath);
+                MarkdownDocumentWindow.Open(fullPath, string.IsNullOrEmpty(anchor) ? null : anchor);
             else
                 EditorUtility.OpenWithDefaultApp(fullPath);
         }
@@ -602,16 +765,16 @@ namespace KodachiGames.Markdown.Editor
             return color;
         }
 
-        static string PlainText(string text)
+        static string PlainText(string text, RenderContext ctx)
         {
             var runs = new List<InlineRun>();
-            ParseInline(text, InlineStyle.None, null, null, runs);
+            ParseInline(text, InlineStyle.None, null, null, ctx, runs);
             var builder = new StringBuilder();
             foreach (var run in runs) builder.Append(run.Text);
             return builder.ToString();
         }
 
-        static void ParseInline(string text, InlineStyle style, string link, Color? color, List<InlineRun> runs)
+        static void ParseInline(string text, InlineStyle style, string link, Color? color, RenderContext ctx, List<InlineRun> runs)
         {
             var plain = new StringBuilder();
 
@@ -626,6 +789,14 @@ namespace KodachiGames.Markdown.Editor
             while (i < text.Length)
             {
                 var ch = text[i];
+
+                if (ch == LineBreak)
+                {
+                    Flush();
+                    runs.Add(new InlineRun(LineBreak.ToString(), style, link, color));
+                    i++;
+                    continue;
+                }
 
                 if (ch == '\\' && i + 1 < text.Length && (char.IsPunctuation(text[i + 1]) || char.IsSymbol(text[i + 1])))
                 {
@@ -658,32 +829,63 @@ namespace KodachiGames.Markdown.Editor
                     if (m.Success)
                     {
                         Flush();
-                        ParseInline(m.Groups[1].Value, style, m.Groups[2].Value, color, runs);
+                        ParseInline(m.Groups[1].Value, style, m.Groups[2].Value, color, ctx, runs);
                         i = start + m.Length;
                         continue;
                     }
-                }
 
-                if (link == null && ch == '<')
-                {
-                    var m = AutolinkAt.Match(text, i);
+                    m = ReferenceLinkAt.Match(text, start);
                     if (m.Success)
                     {
+                        var key = m.Groups[2].Value.Length > 0 ? m.Groups[2].Value : m.Groups[1].Value;
+                        if (ctx.References.TryGetValue(key.Trim(), out var url))
+                        {
+                            Flush();
+                            ParseInline(m.Groups[1].Value, style, url, color, ctx, runs);
+                            i = start + m.Length;
+                            continue;
+                        }
+                    }
+
+                    m = ShortcutLinkAt.Match(text, start);
+                    if (m.Success && ctx.References.TryGetValue(m.Groups[1].Value.Trim(), out var shortcutUrl))
+                    {
                         Flush();
-                        runs.Add(new InlineRun(m.Groups[1].Value, style, m.Groups[1].Value, color));
-                        i += m.Length;
+                        ParseInline(m.Groups[1].Value, style, shortcutUrl, color, ctx, runs);
+                        i = start + m.Length;
                         continue;
                     }
                 }
 
                 if (ch == '<')
                 {
+                    var br = BreakAt.Match(text, i);
+                    if (br.Success)
+                    {
+                        Flush();
+                        runs.Add(new InlineRun(LineBreak.ToString(), style, link, color));
+                        i += br.Length;
+                        continue;
+                    }
+
+                    if (link == null)
+                    {
+                        var auto = AutolinkAt.Match(text, i);
+                        if (auto.Success)
+                        {
+                            Flush();
+                            runs.Add(new InlineRun(auto.Groups[1].Value, style, auto.Groups[1].Value, color));
+                            i += auto.Length;
+                            continue;
+                        }
+                    }
+
                     var m = SpanAt.Match(text, i);
                     if (!m.Success) m = FontAt.Match(text, i);
                     if (m.Success)
                     {
                         Flush();
-                        ParseInline(m.Groups[2].Value, style, link, ParseColor(m.Groups[1].Value), runs);
+                        ParseInline(m.Groups[2].Value, style, link, ParseColor(m.Groups[1].Value), ctx, runs);
                         i += m.Length;
                         continue;
                     }
@@ -693,7 +895,7 @@ namespace KodachiGames.Markdown.Editor
                     TryDelimited(text, i, "__", out end, out inner))
                 {
                     Flush();
-                    ParseInline(inner, style | InlineStyle.Bold, link, color, runs);
+                    ParseInline(inner, style | InlineStyle.Bold, link, color, ctx, runs);
                     i = end;
                     continue;
                 }
@@ -701,7 +903,7 @@ namespace KodachiGames.Markdown.Editor
                 if (TryDelimited(text, i, "~~", out end, out inner))
                 {
                     Flush();
-                    ParseInline(inner, style | InlineStyle.Strike, link, color, runs);
+                    ParseInline(inner, style | InlineStyle.Strike, link, color, ctx, runs);
                     i = end;
                     continue;
                 }
@@ -710,7 +912,7 @@ namespace KodachiGames.Markdown.Editor
                     TryDelimited(text, i, "_", out end, out inner))
                 {
                     Flush();
-                    ParseInline(inner, style | InlineStyle.Italic, link, color, runs);
+                    ParseInline(inner, style | InlineStyle.Italic, link, color, ctx, runs);
                     i = end;
                     continue;
                 }
