@@ -131,13 +131,15 @@ namespace KodachiGames.Markdown.Editor
         public static void ScrollToAnchorAfterLayout(VisualElement container, string anchor)
         {
             var target = FindAnchor((Dictionary<string, VisualElement>)container.userData, anchor);
+            var scroll = container.GetFirstAncestorOfType<ScrollView>()
+                ?? throw new InvalidOperationException("Markdown content is not inside a ScrollView, so it cannot scroll to an anchor.");
             EventCallback<GeometryChangedEvent> handler = null;
             handler = _ =>
             {
-                target.UnregisterCallback(handler);
-                ScrollTo(target);
+                scroll.contentContainer.UnregisterCallback(handler);
+                scroll.schedule.Execute(() => ScrollTo(scroll, target));
             };
-            target.RegisterCallback(handler);
+            scroll.contentContainer.RegisterCallback(handler);
         }
 
         static VisualElement FindAnchor(Dictionary<string, VisualElement> anchors, string anchor)
@@ -147,12 +149,10 @@ namespace KodachiGames.Markdown.Editor
             return target;
         }
 
-        static void ScrollTo(VisualElement target)
+        static void ScrollTo(ScrollView scroll, VisualElement target)
         {
-            var scroll = target.GetFirstAncestorOfType<ScrollView>()
-                ?? throw new InvalidOperationException("Markdown content is not inside a ScrollView, so it cannot scroll to an anchor.");
-            var delta = target.worldBound.y - scroll.contentViewport.worldBound.y;
-            scroll.scrollOffset = new Vector2(scroll.scrollOffset.x, scroll.scrollOffset.y + delta);
+            var y = scroll.contentContainer.WorldToLocal(target.worldBound.position).y;
+            scroll.scrollOffset = new Vector2(scroll.scrollOffset.x, y);
         }
 
         static List<SourceLine> Preprocess(string[] lines, RenderContext ctx)
@@ -220,6 +220,7 @@ namespace KodachiGames.Markdown.Editor
         {
             var paragraph = new List<string>();
             var fence = new List<string>();
+            var fenceLanguage = string.Empty;
             var inFence = false;
 
             void FlushParagraph()
@@ -236,8 +237,8 @@ namespace KodachiGames.Markdown.Editor
                 var line = lines[i].Text;
                 if (IsFence(line))
                 {
-                    if (inFence) { container.Add(CodeBlock(fence)); fence.Clear(); inFence = false; }
-                    else { FlushParagraph(); inFence = true; }
+                    if (inFence) { container.Add(CodeBlock(fence, fenceLanguage)); fence.Clear(); inFence = false; }
+                    else { FlushParagraph(); fenceLanguage = line.TrimStart().Substring(3).Trim().ToLowerInvariant(); inFence = true; }
                     continue;
                 }
 
@@ -336,7 +337,7 @@ namespace KodachiGames.Markdown.Editor
                 paragraph.Add(line);
             }
 
-            if (inFence && fence.Count > 0) container.Add(CodeBlock(fence));
+            if (inFence && fence.Count > 0) container.Add(CodeBlock(fence, fenceLanguage));
             FlushParagraph();
         }
 
@@ -491,7 +492,7 @@ namespace KodachiGames.Markdown.Editor
             return row;
         }
 
-        static VisualElement CodeBlock(List<string> codeLines)
+        static VisualElement CodeBlock(List<string> codeLines, string language)
         {
             var box = new VisualElement
             {
@@ -505,13 +506,67 @@ namespace KodachiGames.Markdown.Editor
                 }
             };
 
-            var label = new Label(string.Join("\n", codeLines)) { enableRichText = false };
+            var code = string.Join("\n", codeLines);
+            if (language is "csharp" or "cs" or "c#")
+            {
+                foreach (var line in CSharpHighlighter.Tokenize(code)) box.Add(CodeLine(line));
+                var copy = new Button(() => EditorGUIUtility.systemCopyBuffer = code) { text = "Copy" };
+                copy.style.position = Position.Absolute;
+                copy.style.top = 2;
+                copy.style.right = 2;
+                copy.style.fontSize = 10;
+                box.Add(copy);
+                return box;
+            }
+
+            var label = new Label(code) { enableRichText = false };
             label.style.whiteSpace = WhiteSpace.Normal;
             label.style.color = CodeColor;
             label.selection.isSelectable = true;
             box.Add(label);
             return box;
         }
+
+        static VisualElement CodeLine(List<CodeToken> tokens)
+        {
+            var row = new VisualElement { style = { flexDirection = FlexDirection.Row, flexWrap = Wrap.Wrap, minHeight = BodyFontSize + 3 } };
+            var spaceWidth = Mathf.Round(BodyFontSize * 0.3f);
+            foreach (var token in tokens)
+            {
+                if (token.Kind == CodeTokenKind.Whitespace)
+                {
+                    row.Add(new VisualElement { style = { width = token.Text.Length * spaceWidth } });
+                    continue;
+                }
+                var label = new Label(token.Text) { enableRichText = false };
+                label.style.whiteSpace = WhiteSpace.NoWrap;
+                label.style.marginLeft = 0;
+                label.style.marginRight = 0;
+                label.style.marginTop = 0;
+                label.style.marginBottom = 0;
+                label.style.paddingLeft = 0;
+                label.style.paddingRight = 0;
+                label.style.paddingTop = 0;
+                label.style.paddingBottom = 0;
+                label.style.color = TokenColor(token.Kind);
+                if (token.Kind == CodeTokenKind.Comment) label.style.unityFontStyleAndWeight = FontStyle.Italic;
+                row.Add(label);
+            }
+            return row;
+        }
+
+        static Color TokenColor(CodeTokenKind kind) => kind switch
+        {
+            CodeTokenKind.Plain => new Color(0.86f, 0.86f, 0.86f),
+            CodeTokenKind.Keyword => new Color(0.34f, 0.61f, 0.84f),
+            CodeTokenKind.Type => new Color(0.31f, 0.79f, 0.69f),
+            CodeTokenKind.Method => new Color(0.86f, 0.86f, 0.67f),
+            CodeTokenKind.String => new Color(0.81f, 0.57f, 0.47f),
+            CodeTokenKind.Number => new Color(0.71f, 0.81f, 0.66f),
+            CodeTokenKind.Comment => new Color(0.42f, 0.6f, 0.33f),
+            CodeTokenKind.Preprocessor => new Color(0.61f, 0.61f, 0.61f),
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null)
+        };
 
         static bool IsTableStart(List<SourceLine> lines, int index)
         {
@@ -744,7 +799,9 @@ namespace KodachiGames.Markdown.Editor
             if (relative.Length == 0)
             {
                 if (string.IsNullOrEmpty(anchor)) return;
-                ScrollTo(FindAnchor(ctx.Anchors, anchor));
+                var target = FindAnchor(ctx.Anchors, anchor);
+                ScrollTo(target.GetFirstAncestorOfType<ScrollView>()
+                    ?? throw new InvalidOperationException("Markdown content is not inside a ScrollView, so it cannot scroll to an anchor."), target);
                 return;
             }
 
