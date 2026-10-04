@@ -14,11 +14,19 @@ Select it and it renders on the right, headings, tables and code blocks included
 
 - Folders that contain only one sub-folder are merged into one row (`Scripts/Editor`), so deep paths
   stay short.
-- **Search** filters by file name. **Refresh** rescans the disk.
+- **Search** filters by file name. **Refresh** rescans the disk. Clearing the search keeps the open
+  file selected and scrolls the tree to it.
+- **History**, under the tree, lists recently opened files, newest first. Click one to reopen it.
+  Drag the bar between tree and history to resize.
 - **Hide Tree / Show Tree** gives the document the whole window.
 - Double-click a file to open it in your external editor.
 
 ## Document pane
+
+- **Ctrl+F** opens a find bar above the open file (here and in the pinned popup). Matches are
+  highlighted; the current one is orange. **Enter** / **F3** goes to the next match, **Shift+Enter**
+  to the previous, **Esc** closes the bar. In the raw view the match is selected, and closing the bar
+  puts the cursor on it.
 
 - **Formatted:** on, the file is rendered. Off, it is shown as plain text you can edit; changes are
   written to disk as you type.

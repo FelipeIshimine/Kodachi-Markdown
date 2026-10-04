@@ -52,6 +52,12 @@ namespace KodachiGames.Markdown.Editor
         Button _openButton;
         Button _revealButton;
 
+        MarkdownFindBar _find;
+        ListView _historyList;
+        List<string> _history;
+        Dictionary<string, int> _fileIds = new();
+        const int HistoryLimit = 30;
+
         FileEntrySelection _selected;
         MarkdownFileTree.FileEntry _pendingFile;
         string _rawText;
@@ -71,6 +77,12 @@ namespace KodachiGames.Markdown.Editor
 
             var root = rootVisualElement;
             root.style.flexDirection = FlexDirection.Column;
+            root.RegisterCallback<KeyDownEvent>(e =>
+            {
+                if (e.keyCode != KeyCode.F || !e.actionKey || _rawText == null) return;
+                e.StopPropagation();
+                _find.Open();
+            }, TrickleDown.TrickleDown);
 
             // ---- Toolbar ----
             var toolbar = new VisualElement
@@ -114,7 +126,12 @@ namespace KodachiGames.Markdown.Editor
             _tree.bindItem = BindRow;
             _tree.selectionChanged += _ => OnSelectionChanged();
             _tree.itemsChosen += _ => OpenSelectedExternally();
-            _leftPane.Add(_tree);
+            var treeSplit = new TwoPaneSplitView(1, 140, TwoPaneSplitViewOrientation.Vertical) { style = { flexGrow = 1 } };
+            var treePane = new VisualElement { style = { flexGrow = 1, minHeight = 60 } };
+            treePane.Add(_tree);
+            treeSplit.Add(treePane);
+            treeSplit.Add(BuildHistoryPane());
+            _leftPane.Add(treeSplit);
             _split.Add(_leftPane);
 
             _split.Add(BuildPreviewPane());
@@ -148,6 +165,66 @@ namespace KodachiGames.Markdown.Editor
             SessionState.SetBool(TreeVisibleKey, _treeVisible);
         }
 
+        VisualElement BuildHistoryPane()
+        {
+            var pane = new VisualElement { style = { flexGrow = 1, minHeight = 40, borderTopWidth = 1, borderTopColor = new Color(0, 0, 0, 0.3f) } };
+            pane.Add(new Label("History") { style = { unityFontStyleAndWeight = FontStyle.Bold, paddingLeft = 4, paddingTop = 2, paddingBottom = 2 } });
+
+            _history = LoadHistory();
+            _historyList = new ListView(_history, 20, MakeRow, BindHistoryRow) { style = { flexGrow = 1 } };
+            _historyList.selectionChanged += _ => OnHistoryChosen();
+            pane.Add(_historyList);
+            return pane;
+        }
+
+        void BindHistoryRow(VisualElement row, int index)
+        {
+            var rel = _history[index];
+            row.Q<Image>().image = _fileIcon;
+            var label = row.Q<Label>();
+            label.text = Path.GetFileName(rel);
+            label.tooltip = rel;
+        }
+
+        void OnHistoryChosen()
+        {
+            if (_historyList.selectedIndex < 0) return;
+            var rel = _history[_historyList.selectedIndex];
+            _historyList.SetSelectionWithoutNotify(System.Array.Empty<int>());
+
+            if (_fileIds.TryGetValue(rel, out var id))
+            {
+                RevealInTree(id);
+                return;
+            }
+
+            _tree.SetSelectionWithoutNotify(System.Array.Empty<int>());
+            var full = ProjectRoot + "/" + rel;
+            ShowPreview(new MarkdownFileTree.FileEntry { Name = Path.GetFileName(rel), RelPath = rel, FullPath = full });
+        }
+
+        void PushHistory(string rel)
+        {
+            _history.Remove(rel);
+            _history.Insert(0, rel);
+            if (_history.Count > HistoryLimit)
+                _history.RemoveRange(HistoryLimit, _history.Count - HistoryLimit);
+            EditorPrefs.SetString(HistoryKey, string.Join("\n", _history));
+            _historyList.RefreshItems();
+        }
+
+        static List<string> LoadHistory()
+        {
+            var stored = EditorPrefs.GetString(HistoryKey, "");
+            var history = new List<string>();
+            foreach (var rel in stored.Split('\n'))
+                if (rel.Length > 0 && File.Exists(ProjectRoot + "/" + rel))
+                    history.Add(rel);
+            return history;
+        }
+
+        static string HistoryKey => "KodachiMarkdown.History." + ProjectRoot;
+
         VisualElement BuildPreviewPane()
         {
             var pane = new VisualElement { style = { flexGrow = 1, paddingTop = 4, paddingLeft = 6, paddingRight = 6, paddingBottom = 6 } };
@@ -175,6 +252,8 @@ namespace KodachiGames.Markdown.Editor
             _previewScroll = new ScrollView(ScrollViewMode.Vertical) { style = { flexGrow = 1 } };
             _previewContent = new VisualElement { style = { paddingRight = 4 } };
             _previewScroll.Add(_previewContent);
+            _find = new MarkdownFindBar(_previewScroll, _previewContent);
+            pane.Add(_find);
             pane.Add(_previewScroll);
 
             return pane;
@@ -215,28 +294,51 @@ namespace KodachiGames.Markdown.Editor
             var count = MarkdownFileTree.CountFiles(tree);
 
             var id = 0;
+            var fileIds = new Dictionary<string, int>();
             var items = new List<TreeViewItemData<object>>();
             foreach (var folder in tree.Folders)
-                items.Add(BuildFolderItem(folder, ref id));
+                items.Add(BuildFolderItem(folder, ref id, fileIds));
             foreach (var file in tree.Files)
+            {
+                fileIds.Add(file.RelPath, id);
                 items.Add(new TreeViewItemData<object>(id++, file));
+            }
 
+            var keep = _selected;
+            _tree.SetSelectionWithoutNotify(System.Array.Empty<int>());
             _tree.SetRootItems(items);
             _tree.Rebuild();
+            if (!string.IsNullOrWhiteSpace(_search.value))
+                _tree.ExpandAll();
 
             _status.text = count == 1 ? "1 file" : $"{count} files";
 
-            // Selection is rebuilt away — reset the preview.
-            ClearSelection();
+            _fileIds = fileIds;
+            _selected = keep;
+            if (keep != null && fileIds.TryGetValue(keep.RelPath, out var selectedId))
+                RevealInTree(selectedId);
+            else
+                ClearSelection();
         }
 
-        static TreeViewItemData<object> BuildFolderItem(MarkdownFileTree.FolderNode folder, ref int id)
+        void RevealInTree(int id)
+        {
+            for (var parent = _tree.viewController.GetParentId(id); parent != -1; parent = _tree.viewController.GetParentId(parent))
+                _tree.ExpandItem(parent);
+            _tree.SetSelectionById(id);
+            _tree.ScrollToItemById(id);
+        }
+
+        static TreeViewItemData<object> BuildFolderItem(MarkdownFileTree.FolderNode folder, ref int id, Dictionary<string, int> fileIds)
         {
             var children = new List<TreeViewItemData<object>>();
             foreach (var sub in folder.Folders)
-                children.Add(BuildFolderItem(sub, ref id));
+                children.Add(BuildFolderItem(sub, ref id, fileIds));
             foreach (var file in folder.Files)
+            {
+                fileIds.Add(file.RelPath, id);
                 children.Add(new TreeViewItemData<object>(id++, file));
+            }
 
             return new TreeViewItemData<object>(id++, folder, children);
         }
@@ -253,6 +355,7 @@ namespace KodachiGames.Markdown.Editor
         {
             _selected = new FileEntrySelection { FullPath = file.FullPath, RelPath = file.RelPath };
             _previewPath.text = file.RelPath;
+            PushHistory(file.RelPath);
             _openButton.style.display = DisplayStyle.Flex;
             _revealButton.style.display = DisplayStyle.Flex;
             _pinButton.style.display = DisplayStyle.Flex;
@@ -320,6 +423,7 @@ namespace KodachiGames.Markdown.Editor
             }
 
             _previewScroll.scrollOffset = Vector2.zero;
+            _find.Refresh();
         }
 
         static readonly System.Text.RegularExpressions.Regex CheckboxMarker =

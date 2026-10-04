@@ -111,6 +111,7 @@ namespace KodachiGames.Markdown.Editor
         VisualElement _tabBar;
         VisualElement _emptyView;
         ScrollView    _scroll;
+        MarkdownFindBar _find;
         VisualElement _content;
         Label         _title;
         DropdownField _modeDropdown;
@@ -223,6 +224,8 @@ namespace KodachiGames.Markdown.Editor
             _scroll = new ScrollView(ScrollViewMode.Vertical) { style = { flexGrow = 1 } };
             _content = new VisualElement { style = { paddingTop = 4, paddingLeft = 8, paddingRight = 8, paddingBottom = 8 } };
             _scroll.Add(_content);
+            _find = new MarkdownFindBar(_scroll, _content) { style = { marginLeft = 8, marginRight = 8, marginTop = 4 } };
+            root.Add(_find);
             root.Add(_scroll);
 
             // Focus the first task row (Tasks mode) so arrows work immediately; else the root.
@@ -398,6 +401,7 @@ namespace KodachiGames.Markdown.Editor
             var targetY = _scrollByRel.TryGetValue(_activeRel ?? "", out var y) ? y : 0f;
             _scroll.scrollOffset = new Vector2(0, targetY);
             _scroll.schedule.Execute(() => _scroll.scrollOffset = new Vector2(0, targetY));
+            _find.Refresh();
         }
 
         /// <summary>Remember the current scroll offset so the next Render restores it in place.</summary>
@@ -551,6 +555,11 @@ namespace KodachiGames.Markdown.Editor
                 if (rootVisualElement.focusController?.focusedElement is TextField) return;
                 e.StopPropagation();
                 Close();
+            }
+            else if (e.keyCode == KeyCode.F && e.actionKey && _rawText != null)
+            {
+                e.StopPropagation();
+                _find.Open();
             }
             else if (e.keyCode == KeyCode.E && e.actionKey && _modeDropdown != null)
             {
