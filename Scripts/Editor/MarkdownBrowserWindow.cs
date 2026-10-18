@@ -361,27 +361,19 @@ namespace KodachiGames.Markdown.Editor
             _pinButton.style.display = DisplayStyle.Flex;
             RefreshPinButton();
 
-            try
+            var info = new FileInfo(file.FullPath);
+            if (info.Length > PreviewCharLimit)
             {
-                var info = new FileInfo(file.FullPath);
-                if (info.Length > PreviewCharLimit)
-                {
-                    using var reader = info.OpenText();
-                    var buffer = new char[PreviewCharLimit];
-                    var read = reader.Read(buffer, 0, buffer.Length);
-                    _rawText = new string(buffer, 0, read) + "\n\n… (truncated)";
-                    _truncated = true;
-                }
-                else
-                {
-                    _rawText = File.ReadAllText(file.FullPath);
-                    _truncated = false;
-                }
-            }
-            catch (System.Exception e)
-            {
-                _rawText = $"(could not read file)\n{e.Message}";
+                using var reader = info.OpenText();
+                var buffer = new char[PreviewCharLimit];
+                var read = reader.Read(buffer, 0, buffer.Length);
+                _rawText = new string(buffer, 0, read) + "\n\n… (truncated)";
                 _truncated = true;
+            }
+            else
+            {
+                _rawText = File.ReadAllText(file.FullPath);
+                _truncated = false;
             }
 
             RenderPreview();
@@ -443,21 +435,14 @@ namespace KodachiGames.Markdown.Editor
             lines[lineIndex] = CheckboxMarker.Replace(lines[lineIndex], isChecked ? "[x]" : "[ ]", 1);
             _rawText = string.Join("\n", lines);
 
-            try
-            {
-                File.WriteAllText(_selected.FullPath, _rawText);
+            File.WriteAllText(_selected.FullPath, _rawText);
 
-                // Keep the asset database in sync when the file lives under Assets/.
-                var dataPath = Application.dataPath.Replace('\\', '/');
-                if (_selected.FullPath.StartsWith(dataPath + "/", System.StringComparison.OrdinalIgnoreCase))
-                {
-                    var assetPath = "Assets" + _selected.FullPath.Substring(dataPath.Length);
-                    AssetDatabase.ImportAsset(assetPath);
-                }
-            }
-            catch (System.Exception e)
+            // Keep the asset database in sync when the file lives under Assets/.
+            var dataPath = Application.dataPath.Replace('\\', '/');
+            if (_selected.FullPath.StartsWith(dataPath + "/", System.StringComparison.OrdinalIgnoreCase))
             {
-                Debug.LogError($"Failed to write checkbox change to {_selected.RelPath}: {e.Message}");
+                var assetPath = "Assets" + _selected.FullPath.Substring(dataPath.Length);
+                AssetDatabase.ImportAsset(assetPath);
             }
 
             RenderPreview();
@@ -466,16 +451,9 @@ namespace KodachiGames.Markdown.Editor
         void WriteRawText()
         {
             if (_selected == null || _rawText == null) return;
-            try
-            {
-                File.WriteAllText(_selected.FullPath, _rawText);
-                // Unity will pick up the change on editor focus; no need to call
-                // AssetDatabase.ImportAsset on every keystroke.
-            }
-            catch (System.Exception e)
-            {
-                Debug.LogError($"Failed to write {_selected.RelPath}: {e.Message}");
-            }
+            File.WriteAllText(_selected.FullPath, _rawText);
+            // Unity will pick up the change on editor focus; no need to call
+            // AssetDatabase.ImportAsset on every keystroke.
         }
 
         void ClearSelection()

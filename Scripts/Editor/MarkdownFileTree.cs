@@ -80,16 +80,8 @@ namespace KodachiGames.Markdown.Editor
 
                 string[] files;
                 string[] subDirs;
-                try
-                {
-                    files = Directory.GetFiles(dir, "*.md");
-                    subDirs = Directory.GetDirectories(dir);
-                }
-                catch (System.Exception)
-                {
-                    // Unreadable directory (permissions, races) — just skip it.
-                    continue;
-                }
+                files = Directory.GetFiles(dir, "*.md");
+                subDirs = Directory.GetDirectories(dir);
 
                 foreach (var file in files)
                     yield return file.Replace('\\', '/');

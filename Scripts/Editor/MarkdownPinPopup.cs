@@ -316,34 +316,26 @@ namespace KodachiGames.Markdown.Editor
 
         void LoadRawText(string fullPath)
         {
-            try
+            var info = new FileInfo(fullPath);
+            if (!info.Exists)
             {
-                var info = new FileInfo(fullPath);
-                if (!info.Exists)
-                {
-                    _rawText = "(file not found — it may have been moved or deleted)";
-                    _truncated = true;
-                    return;
-                }
-
-                if (info.Length > PreviewCharLimit)
-                {
-                    using var reader = info.OpenText();
-                    var buffer = new char[PreviewCharLimit];
-                    var read = reader.Read(buffer, 0, buffer.Length);
-                    _rawText = new string(buffer, 0, read) + "\n\n… (truncated)";
-                    _truncated = true;
-                }
-                else
-                {
-                    _rawText = File.ReadAllText(fullPath);
-                    _truncated = false;
-                }
-            }
-            catch (Exception e)
-            {
-                _rawText = $"(could not read file)\n{e.Message}";
+                _rawText = "(file not found — it may have been moved or deleted)";
                 _truncated = true;
+                return;
+            }
+
+            if (info.Length > PreviewCharLimit)
+            {
+                using var reader = info.OpenText();
+                var buffer = new char[PreviewCharLimit];
+                var read = reader.Read(buffer, 0, buffer.Length);
+                _rawText = new string(buffer, 0, read) + "\n\n… (truncated)";
+                _truncated = true;
+            }
+            else
+            {
+                _rawText = File.ReadAllText(fullPath);
+                _truncated = false;
             }
         }
 
@@ -416,16 +408,9 @@ namespace KodachiGames.Markdown.Editor
             if (string.IsNullOrEmpty(_activeRel) || _rawText == null) return;
 
             var fullPath = MarkdownPins.ToFull(_activeRel);
-            try
-            {
-                File.WriteAllText(fullPath, _rawText);
-                // Unity will pick up the change on editor focus; no need to call
-                // AssetDatabase.ImportAsset on every keystroke.
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"Failed to write {_activeRel}: {e.Message}");
-            }
+            File.WriteAllText(fullPath, _rawText);
+            // Unity will pick up the change on editor focus; no need to call
+            // AssetDatabase.ImportAsset on every keystroke.
         }
 
         static readonly Regex CheckboxMarker = new(@"\[[ xX]\]");
@@ -497,17 +482,10 @@ namespace KodachiGames.Markdown.Editor
         {
             if (string.IsNullOrEmpty(_activeRel)) return;
             var fullPath = MarkdownPins.ToFull(_activeRel);
-            try
-            {
-                File.WriteAllText(fullPath, _rawText);
-                var dataPath = Application.dataPath.Replace('\\', '/');
-                if (fullPath.StartsWith(dataPath + "/", StringComparison.OrdinalIgnoreCase))
-                    AssetDatabase.ImportAsset("Assets" + fullPath.Substring(dataPath.Length));
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"Failed to write {_activeRel}: {e.Message}");
-            }
+            File.WriteAllText(fullPath, _rawText);
+            var dataPath = Application.dataPath.Replace('\\', '/');
+            if (fullPath.StartsWith(dataPath + "/", StringComparison.OrdinalIgnoreCase))
+                AssetDatabase.ImportAsset("Assets" + fullPath.Substring(dataPath.Length));
             SaveScroll();
             Render();
         }
@@ -524,20 +502,13 @@ namespace KodachiGames.Markdown.Editor
             _rawText = string.Join("\n", lines);
 
             var fullPath = MarkdownPins.ToFull(_activeRel);
-            try
-            {
-                File.WriteAllText(fullPath, _rawText);
+            File.WriteAllText(fullPath, _rawText);
 
-                var dataPath = Application.dataPath.Replace('\\', '/');
-                if (fullPath.StartsWith(dataPath + "/", StringComparison.OrdinalIgnoreCase))
-                {
-                    var assetPath = "Assets" + fullPath.Substring(dataPath.Length);
-                    AssetDatabase.ImportAsset(assetPath);
-                }
-            }
-            catch (Exception e)
+            var dataPath = Application.dataPath.Replace('\\', '/');
+            if (fullPath.StartsWith(dataPath + "/", StringComparison.OrdinalIgnoreCase))
             {
-                Debug.LogError($"Failed to write change to {_activeRel}: {e.Message}");
+                var assetPath = "Assets" + fullPath.Substring(dataPath.Length);
+                AssetDatabase.ImportAsset(assetPath);
             }
 
             // Keep the scroll position; in Tasks mode the list re-sorts under the cursor.
